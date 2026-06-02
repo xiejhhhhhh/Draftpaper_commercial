@@ -1,0 +1,381 @@
+"""Runtime dependency container for service and adapter entrypoints."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Hashable, Mapping
+
+from .artifacts import DEFAULT_ARTIFACT_MODE, ArtifactMode, ArtifactStore
+from .config import (
+    CLOAKBROWSER_BINARY_PATH_ENV_VAR,
+    HTTP_DISK_CACHE_DIR_ENV_VAR,
+    HTTP_DISK_CACHE_ENV_VAR,
+    HTTP_DISK_CACHE_MAX_AGE_DAYS_ENV_VAR,
+    HTTP_DISK_CACHE_MAX_BYTES_ENV_VAR,
+    HTTP_DISK_CACHE_MAX_ENTRIES_ENV_VAR,
+    HTTP_METADATA_CACHE_TTL_ENV_VAR,
+    HTTP_PER_HOST_CONCURRENCY_ENV_VAR,
+    HTTP_POOL_MAXSIZE_ENV_VAR,
+    HTTP_POOL_NUM_POOLS_ENV_VAR,
+    build_runtime_env,
+    env_flag_enabled,
+    parse_nonnegative_int_env,
+    parse_positive_int_env,
+    resolve_user_data_dir,
+)
+from .http import (
+    DEFAULT_METADATA_CACHE_TTL_SECONDS,
+    DEFAULT_PER_HOST_CONCURRENCY,
+    DEFAULT_POOL_MAXSIZE,
+    DEFAULT_POOL_NUM_POOLS,
+    DEFAULT_DISK_CACHE_MAX_AGE_DAYS,
+    DEFAULT_DISK_CACHE_MAX_BYTES,
+    DEFAULT_DISK_CACHE_MAX_ENTRIES,
+    HttpTransport,
+)
+from .runtime_browser import BrowserContextManager
+
+RUNTIME_UNSET = object()
+_PARSE_CACHE_MISSING = object()
+_SESSION_CACHE_MISSING = object()
+
+
+def _transport_disk_cache_dir(
+    env: Mapping[str, str],
+    download_dir: Path | None,
+    *,
+    artifact_mode: ArtifactMode = DEFAULT_ARTIFACT_MODE,
+) -> Path | None:
+    if artifact_mode != "all":
+        return None
+    configured = str(env.get(HTTP_DISK_CACHE_DIR_ENV_VAR, "")).strip()
+    if configured:
+        return Path(configured).expanduser()
+    if download_dir is not None:
+        return download_dir / ".paper-fetch-http-cache"
+    if env_flag_enabled(env, HTTP_DISK_CACHE_ENV_VAR):
+        return resolve_user_data_dir(env) / "http-cache"
+    return None
+
+
+def build_http_transport_for_context(
+    env: Mapping[str, str],
+    *,
+    download_dir: Path | None,
+    cancel_check: Callable[[], bool] | None,
+    artifact_mode: ArtifactMode = DEFAULT_ARTIFACT_MODE,
+) -> HttpTransport:
+    metadata_cache_ttl = parse_nonnegative_int_env(
+        env,
+        HTTP_METADATA_CACHE_TTL_ENV_VAR,
+        default=DEFAULT_METADATA_CACHE_TTL_SECONDS,
+    )
+    disk_cache_max_age_days = parse_nonnegative_int_env(
+        env,
+        HTTP_DISK_CACHE_MAX_AGE_DAYS_ENV_VAR,
+        default=DEFAULT_DISK_CACHE_MAX_AGE_DAYS,
+    )
+    return HttpTransport(
+        pool_num_pools=parse_positive_int_env(env, HTTP_POOL_NUM_POOLS_ENV_VAR, default=DEFAULT_POOL_NUM_POOLS),
+        pool_maxsize=parse_positive_int_env(env, HTTP_POOL_MAXSIZE_ENV_VAR, default=DEFAULT_POOL_MAXSIZE),
+        per_host_concurrency=parse_positive_int_env(
+            env,
+            HTTP_PER_HOST_CONCURRENCY_ENV_VAR,
+            default=DEFAULT_PER_HOST_CONCURRENCY,
+        ),
+        metadata_cache_ttl=metadata_cache_ttl,
+        disk_cache_dir=_transport_disk_cache_dir(
+            env,
+            download_dir,
+            artifact_mode=artifact_mode,
+        ),
+        disk_cache_max_entries=parse_nonnegative_int_env(
+            env,
+            HTTP_DISK_CACHE_MAX_ENTRIES_ENV_VAR,
+            default=DEFAULT_DISK_CACHE_MAX_ENTRIES,
+        ),
+        disk_cache_max_bytes=parse_nonnegative_int_env(
+            env,
+            HTTP_DISK_CACHE_MAX_BYTES_ENV_VAR,
+            default=DEFAULT_DISK_CACHE_MAX_BYTES,
+        ),
+        disk_cache_max_age_seconds=disk_cache_max_age_days * 24 * 60 * 60,
+        cancel_check=cancel_check,
+    )
+
+
+@dataclass
+class RuntimeContext:
+    """Holds runtime dependencies shared across service, workflow, and adapters."""
+
+    env: Mapping[str, str] | None = None
+    transport: HttpTransport | None = None
+    clients: Mapping[str, object] | None = None
+    download_dir: Path | None = None
+    artifact_mode: ArtifactMode = DEFAULT_ARTIFACT_MODE
+    cancel_check: Callable[[], bool] | None = None
+    artifact_store: ArtifactStore | None = None
+    fetch_cache: Any | None = None
+    parse_cache: dict[tuple[Hashable, ...], Any] = field(default_factory=dict)
+    session_cache: dict[tuple[Hashable, ...], Any] = field(default_factory=dict)
+    stage_timings: dict[str, float] = field(default_factory=dict)
+    _session_cache_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _stage_timing_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _browser_context_manager_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _browser_context_manager: BrowserContextManager | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.env = build_runtime_env() if self.env is None else dict(self.env)
+        if self.artifact_store is None:
+            self.artifact_store = ArtifactStore.from_download_dir(
+                self.download_dir,
+                artifact_mode=self.artifact_mode,
+            )
+        else:
+            self.artifact_mode = self.artifact_store.artifact_mode
+            if self.download_dir is None:
+                self.download_dir = self.artifact_store.download_dir
+        if self.transport is None:
+            self.transport = build_http_transport_for_context(
+                self.env,
+                download_dir=self.download_dir,
+                cancel_check=self.cancel_check,
+                artifact_mode=self.artifact_mode,
+            )
+        self.stage_timings.setdefault("asset_seconds", 0.0)
+        self.stage_timings.setdefault("formula_seconds", 0.0)
+
+    def get_clients(self) -> Mapping[str, object]:
+        if self.clients is None:
+            from .providers.registry import build_clients
+
+            assert self.transport is not None
+            assert self.env is not None
+            self.clients = build_clients(self.transport, self.env)
+        return self.clients
+
+    def playwright_browser(self, *, headless: bool = True) -> Any:
+        """Return a lazily started shared CloakBrowser browser."""
+
+        return self._browser_lifecycle().browser(headless=headless)
+
+    def new_browser_context(self, *, headless: bool = True, **context_kwargs: Any) -> Any:
+        """Create an isolated browser context from the shared CloakBrowser browser."""
+
+        return self._browser_lifecycle().new_context(headless=headless, **context_kwargs)
+
+    def new_playwright_context(self, *, headless: bool = True, **context_kwargs: Any) -> Any:
+        """Create an isolated browser context from the shared CloakBrowser browser."""
+
+        return self.new_browser_context(headless=headless, **context_kwargs)
+
+    def close_playwright(self) -> None:
+        """Close any browser owned by this runtime context."""
+
+        with self._browser_context_manager_lock:
+            manager = self._browser_context_manager
+        if manager is not None:
+            manager.close()
+
+    def _browser_lifecycle(self) -> BrowserContextManager:
+        with self._browser_context_manager_lock:
+            if self._browser_context_manager is None:
+                binary_path = str((self.env or {}).get(CLOAKBROWSER_BINARY_PATH_ENV_VAR, "")).strip() or None
+                self._browser_context_manager = BrowserContextManager(binary_path=binary_path)
+            return self._browser_context_manager
+
+    def close(self) -> None:
+        self.close_playwright()
+
+    def __del__(self) -> None:  # pragma: no cover - defensive cleanup at GC/interpreter shutdown
+        try:
+            self.close_playwright()
+        except Exception:
+            pass
+
+    def build_parse_cache_key(
+        self,
+        *,
+        provider: str,
+        role: str,
+        source: str | None,
+        body: bytes | bytearray | str | None,
+        parser: str,
+        config: Mapping[str, Any] | None = None,
+    ) -> tuple[Hashable, ...]:
+        """Build a stable key for per-fetch parser/extraction memoization."""
+
+        if isinstance(body, str):
+            body_bytes = body.encode("utf-8", errors="replace")
+        elif isinstance(body, (bytes, bytearray)):
+            body_bytes = bytes(body)
+        else:
+            body_bytes = b""
+        body_digest = hashlib.sha256(body_bytes).hexdigest()
+        normalized_config = tuple(
+            sorted((str(key), repr(value)) for key, value in (config or {}).items())
+        )
+        return (
+            "parse",
+            str(provider or ""),
+            str(role or ""),
+            str(source or ""),
+            body_digest,
+            str(parser or ""),
+            normalized_config,
+        )
+
+    def get_parse_cache(
+        self,
+        key: tuple[Hashable, ...],
+        *,
+        copy_value: bool = True,
+        default: Any = _PARSE_CACHE_MISSING,
+    ) -> Any:
+        value = self.parse_cache.get(key, _PARSE_CACHE_MISSING)
+        if value is _PARSE_CACHE_MISSING:
+            if default is _PARSE_CACHE_MISSING:
+                return None
+            return default
+        return copy.deepcopy(value) if copy_value else value
+
+    def set_parse_cache(
+        self,
+        key: tuple[Hashable, ...],
+        value: Any,
+        *,
+        copy_value: bool = True,
+    ) -> Any:
+        self.parse_cache[key] = copy.deepcopy(value) if copy_value else value
+        return copy.deepcopy(value) if copy_value else value
+
+    def get_or_set_parse_cache(
+        self,
+        key: tuple[Hashable, ...],
+        factory: Callable[[], Any],
+        *,
+        copy_value: bool = True,
+    ) -> Any:
+        cached = self.parse_cache.get(key, _PARSE_CACHE_MISSING)
+        if cached is not _PARSE_CACHE_MISSING:
+            return copy.deepcopy(cached) if copy_value else cached
+        value = factory()
+        return self.set_parse_cache(key, value, copy_value=copy_value)
+
+    def get_session_cache(
+        self,
+        key: tuple[Hashable, ...],
+        *,
+        copy_value: bool = True,
+        default: Any = _SESSION_CACHE_MISSING,
+    ) -> Any:
+        with self._session_cache_lock:
+            value = self.session_cache.get(key, _SESSION_CACHE_MISSING)
+            if value is _SESSION_CACHE_MISSING:
+                if default is _SESSION_CACHE_MISSING:
+                    return None
+                return default
+            return copy.deepcopy(value) if copy_value else value
+
+    def set_session_cache(
+        self,
+        key: tuple[Hashable, ...],
+        value: Any,
+        *,
+        copy_value: bool = True,
+    ) -> Any:
+        stored = copy.deepcopy(value) if copy_value else value
+        with self._session_cache_lock:
+            self.session_cache[key] = stored
+        return copy.deepcopy(stored) if copy_value else stored
+
+    def record_stage_timing(self, name: str, started_at: float) -> float:
+        """Record a non-cumulative stage duration in seconds."""
+
+        elapsed = max(0.0, time.monotonic() - started_at)
+        rounded = round(elapsed, 3)
+        with self._stage_timing_lock:
+            self.stage_timings[str(name)] = rounded
+        return rounded
+
+    def accumulate_stage_timing(
+        self,
+        name: str,
+        *,
+        started_at: float | None = None,
+        elapsed: float | None = None,
+    ) -> float:
+        """Add elapsed seconds to a cumulative stage timing key."""
+
+        if elapsed is None:
+            if started_at is None:
+                raise ValueError("started_at or elapsed is required")
+            elapsed = time.monotonic() - started_at
+        elapsed = max(0.0, float(elapsed))
+        with self._stage_timing_lock:
+            current = self.stage_timings.get(str(name), 0.0)
+            try:
+                current_value = float(current)
+            except (TypeError, ValueError):
+                current_value = 0.0
+            updated = round(max(0.0, current_value + elapsed), 6)
+            self.stage_timings[str(name)] = updated
+            return updated
+
+
+def resolve_runtime_context(
+    context: RuntimeContext | None = None,
+    *,
+    env: Mapping[str, str] | None | object = RUNTIME_UNSET,
+    transport: HttpTransport | None | object = RUNTIME_UNSET,
+    clients: Mapping[str, object] | None | object = RUNTIME_UNSET,
+    download_dir: Path | None | object = RUNTIME_UNSET,
+    cancel_check: Callable[[], bool] | None | object = RUNTIME_UNSET,
+    artifact_store: ArtifactStore | None | object = RUNTIME_UNSET,
+    artifact_mode: ArtifactMode | object = RUNTIME_UNSET,
+    fetch_cache: Any | object = RUNTIME_UNSET,
+    parse_cache: dict[tuple[Hashable, ...], Any] | object = RUNTIME_UNSET,
+    session_cache: dict[tuple[Hashable, ...], Any] | object = RUNTIME_UNSET,
+    stage_timings: dict[str, float] | object = RUNTIME_UNSET,
+) -> RuntimeContext:
+    """Return an explicit context or build one from internal runtime parts."""
+
+    runtime_parts = {
+        "env": env,
+        "transport": transport,
+        "clients": clients,
+        "download_dir": download_dir,
+        "cancel_check": cancel_check,
+        "artifact_store": artifact_store,
+        "artifact_mode": artifact_mode,
+        "fetch_cache": fetch_cache,
+        "parse_cache": parse_cache,
+        "session_cache": session_cache,
+        "stage_timings": stage_timings,
+    }
+    if context is not None:
+        explicit = [name for name, value in runtime_parts.items() if value is not RUNTIME_UNSET]
+        if explicit:
+            joined = ", ".join(explicit)
+            raise TypeError(f"RuntimeContext cannot be combined with runtime keyword arguments: {joined}")
+        return context
+
+    return RuntimeContext(
+        env=None if env is RUNTIME_UNSET else env,
+        transport=None if transport is RUNTIME_UNSET else transport,
+        clients=None if clients is RUNTIME_UNSET else clients,
+        download_dir=None if download_dir is RUNTIME_UNSET else download_dir,
+        cancel_check=None if cancel_check is RUNTIME_UNSET else cancel_check,
+        artifact_store=None if artifact_store is RUNTIME_UNSET else artifact_store,
+        artifact_mode=DEFAULT_ARTIFACT_MODE if artifact_mode is RUNTIME_UNSET else artifact_mode,
+        fetch_cache=None if fetch_cache is RUNTIME_UNSET else fetch_cache,
+        parse_cache={} if parse_cache is RUNTIME_UNSET else parse_cache,
+        session_cache={} if session_cache is RUNTIME_UNSET else session_cache,
+        stage_timings={} if stage_timings is RUNTIME_UNSET else stage_timings,
+    )

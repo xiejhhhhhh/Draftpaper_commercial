@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Resolve DOI, URL, or title queries into a single normalized lookup object."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import urllib.parse
+from dataclasses import asdict, dataclass, field
+from typing import Any, Mapping
+
+from rapidfuzz import fuzz
+
+from ..arxiv_id import (
+    arxiv_id_from_doi,
+    arxiv_id_from_query,
+    arxiv_id_from_url,
+    canonical_arxiv_abs_url,
+    canonical_arxiv_doi,
+)
+from ..config import build_runtime_env, build_user_agent
+from ..errors import ProviderFailure
+from ..extraction.html.landing import fetch_landing_html
+from ..html_lookup import is_usable_html_lookup_title
+from ..http import HttpTransport, RequestFailure
+from ..metadata.crossref import CrossrefLookupClient
+from ..metadata.types import CrossrefMetadata
+from ..mdpi_url import mdpi_doi_from_landing_url
+from ..publisher_identity import extract_doi, infer_provider_from_signals, normalize_doi
+from ..reason_codes import ERROR, NO_RESULT, NOT_SUPPORTED
+CONFIDENT_SCORE_MIN = 0.90
+CONFIDENT_MARGIN_MIN = 0.05
+MIN_HTML_TITLE_LOOKUP_CHARS = 24
+MAX_URL_REDIRECTS = 3
+
+
+@dataclass
+class ResolvedQuery:
+    query: str
+    query_kind: str
+    doi: str | None = None
+    landing_url: str | None = None
+    provider_hint: str | None = None
+    confidence: float = 0.0
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    title: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+def is_url(value: str) -> bool:
+    parsed = urllib.parse.urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def normalize_title(value: str) -> str:
+    lowered = re.sub(r"[^a-z0-9]+", " ", value.lower())
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def token_jaccard_score(left: str, right: str) -> float:
+    left_tokens = set(normalize_title(left).split())
+    right_tokens = set(normalize_title(right).split())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def sequence_ratio(left: str, right: str) -> float:
+    return fuzz.ratio(normalize_title(left), normalize_title(right)) / 100
+
+
+def candidate_score(query: str, candidate_title: str) -> float:
+    jaccard = token_jaccard_score(query, candidate_title)
+    ratio = sequence_ratio(query, candidate_title)
+    return round((0.7 * jaccard) + (0.3 * ratio), 6)
+
+
+def score_candidates(query: str, candidates: list[CrossrefMetadata]) -> list[dict[str, Any]]:
+    scored: list[dict[str, Any]] = []
+    for item in candidates:
+        title = str(item.get("title") or "")
+        score = candidate_score(query, title)
+        provider_hint = infer_provider_from_signals(
+            landing_urls=[str(item.get("landing_page_url") or "")],
+            publishers=[str(item.get("publisher") or "")],
+            doi=str(item.get("doi") or ""),
+        )
+        scored.append(
+            {
+                "doi": item.get("doi"),
+                "title": item.get("title"),
+                "journal_title": item.get("journal_title"),
+                "published": item.get("published"),
+                "landing_page_url": item.get("landing_page_url"),
+                "provider_hint": provider_hint,
+                "score": score,
+            }
+        )
+    return sorted(scored, key=lambda item: item["score"], reverse=True)
+
+
+def is_confident_top_candidate(candidates: list[dict[str, Any]]) -> bool:
+    if not candidates:
+        return False
+    top_one = candidates[0]
+    top_two_score = candidates[1]["score"] if len(candidates) > 1 else 0.0
+    return top_one["score"] >= CONFIDENT_SCORE_MIN and (top_one["score"] - top_two_score) >= CONFIDENT_MARGIN_MIN
+
+
+def resolve_query(
+    query: str,
+    *,
+    transport: HttpTransport | None = None,
+    env: Mapping[str, str] | None = None,
+) -> ResolvedQuery:
+    normalized_query = query.strip()
+    if not normalized_query:
+        raise ProviderFailure(NOT_SUPPORTED, "Query must not be empty.")
+
+    direct_arxiv_id = arxiv_id_from_query(normalized_query)
+    if direct_arxiv_id and (arxiv_id_from_url(normalized_query) or normalized_query.lower().startswith("arxiv:")):
+        return ResolvedQuery(
+            query=normalized_query,
+            query_kind="url" if is_url(normalized_query) else "arxiv_id",
+            doi=canonical_arxiv_doi(direct_arxiv_id),
+            landing_url=canonical_arxiv_abs_url(direct_arxiv_id),
+            provider_hint="arxiv",
+            confidence=1.0,
+        )
+    if direct_arxiv_id and not is_url(normalized_query):
+        direct_arxiv_doi = canonical_arxiv_doi(direct_arxiv_id)
+        return ResolvedQuery(
+            query=normalized_query,
+            query_kind="doi" if arxiv_id_from_doi(normalized_query) else "arxiv_id",
+            doi=direct_arxiv_doi,
+            landing_url=canonical_arxiv_abs_url(direct_arxiv_id),
+            provider_hint="arxiv",
+            confidence=1.0,
+        )
+
+    active_transport = transport or HttpTransport()
+    active_env = env or build_runtime_env()
+    crossref = CrossrefLookupClient(active_transport, active_env)
+
+    if is_url(normalized_query):
+        mdpi_doi = mdpi_doi_from_landing_url(normalized_query)
+        if mdpi_doi:
+            return ResolvedQuery(
+                query=normalized_query,
+                query_kind="url",
+                doi=mdpi_doi,
+                landing_url=normalized_query,
+                provider_hint="mdpi",
+                confidence=1.0,
+            )
+
+        direct_doi = extract_doi(normalized_query)
+        if direct_doi:
+            direct_provider_hint = infer_provider_from_signals(
+                landing_urls=[normalized_query],
+                doi=direct_doi,
+            )
+            if direct_provider_hint is not None:
+                return ResolvedQuery(
+                    query=normalized_query,
+                    query_kind="url",
+                    doi=direct_doi,
+                    landing_url=normalized_query,
+                    provider_hint=direct_provider_hint,
+                    confidence=1.0,
+                )
+        request_headers = {
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": build_user_agent(active_env),
+        }
+        current_url = normalized_query
+        try:
+            landing_fetch = fetch_landing_html(
+                current_url,
+                transport=active_transport,
+                headers=request_headers,
+                max_redirects=MAX_URL_REDIRECTS,
+                retry_on_transient=True,
+            )
+        except RequestFailure as exc:
+            if direct_doi:
+                provider_hint = infer_provider_from_signals(
+                    landing_urls=[normalized_query],
+                    doi=direct_doi,
+                )
+                return ResolvedQuery(
+                    query=normalized_query,
+                    query_kind="url",
+                    doi=direct_doi,
+                    landing_url=normalized_query,
+                    provider_hint=provider_hint,
+                    confidence=1.0,
+                )
+            raise ProviderFailure(ERROR, f"Failed to fetch landing page: {exc}") from exc
+        response_url = landing_fetch.final_url
+        html_metadata = landing_fetch.metadata
+        landing_url = urllib.parse.urljoin(
+            response_url,
+            str(html_metadata.get("landing_page_url") or response_url).strip() or response_url,
+        )
+        resolved_doi = normalize_doi(str(html_metadata.get("doi") or direct_doi or "")) or None
+        provider_hint = infer_provider_from_signals(
+            landing_urls=[response_url, landing_url],
+            doi=resolved_doi,
+        )
+        html_title = str(html_metadata.get("title") or "").strip() or None
+        lookup_title = str(html_metadata.get("lookup_title") or "").strip() or None
+        title_for_lookup = (
+            html_title
+            if is_usable_html_lookup_title(html_title, min_normalized_chars=MIN_HTML_TITLE_LOOKUP_CHARS)
+            else None
+        )
+        if title_for_lookup is None and is_usable_html_lookup_title(
+            lookup_title,
+            min_normalized_chars=MIN_HTML_TITLE_LOOKUP_CHARS,
+        ):
+            title_for_lookup = lookup_title
+        selected_title = html_title or title_for_lookup
+        candidates: list[dict[str, Any]] = []
+        confidence = 1.0 if direct_doi else (0.95 if resolved_doi else 0.0)
+        if title_for_lookup and (not resolved_doi or provider_hint is None):
+            candidates = score_candidates(
+                title_for_lookup,
+                crossref.search_bibliographic_candidates(title_for_lookup, rows=5),
+            )
+            if is_confident_top_candidate(candidates):
+                top_one = candidates[0]
+                if not resolved_doi:
+                    resolved_doi = normalize_doi(str(top_one.get("doi") or "")) or None
+                    confidence = top_one["score"]
+                    selected_title = str(top_one.get("title") or "") or title_for_lookup
+                    candidates = []
+                if provider_hint is None:
+                    provider_hint = top_one.get("provider_hint") or provider_hint
+        return ResolvedQuery(
+            query=normalized_query,
+            query_kind="url",
+            doi=resolved_doi,
+            landing_url=landing_url,
+            provider_hint=provider_hint,
+            confidence=confidence,
+            candidates=candidates,
+            title=selected_title,
+        )
+
+    direct_doi = extract_doi(normalized_query)
+    if direct_doi:
+        provider_hint = infer_provider_from_signals(doi=direct_doi)
+        if provider_hint is None:
+            try:
+                crossref_metadata = crossref.fetch_metadata({"doi": direct_doi})
+            except ProviderFailure:
+                crossref_metadata = None
+            provider_hint = infer_provider_from_signals(
+                landing_urls=[str((crossref_metadata or {}).get("landing_page_url") or "")],
+                publishers=[str((crossref_metadata or {}).get("publisher") or "")],
+                doi=direct_doi,
+            )
+        return ResolvedQuery(
+            query=normalized_query,
+            query_kind="doi",
+            doi=direct_doi,
+            landing_url=None,
+            provider_hint=provider_hint,
+            confidence=1.0,
+        )
+
+    candidates = crossref.search_bibliographic_candidates(normalized_query, rows=5)
+    if not candidates:
+        raise ProviderFailure(NO_RESULT, "Crossref returned no metadata results for the title query.")
+    scored = score_candidates(normalized_query, candidates)
+    top_one = scored[0]
+    if is_confident_top_candidate(scored):
+        return ResolvedQuery(
+            query=normalized_query,
+            query_kind="title",
+            doi=normalize_doi(str(top_one.get("doi") or "")) or None,
+            landing_url=top_one.get("landing_page_url"),
+            provider_hint=top_one.get("provider_hint"),
+            confidence=top_one["score"],
+            candidates=[],
+            title=top_one.get("title"),
+        )
+
+    return ResolvedQuery(
+        query=normalized_query,
+        query_kind="title",
+        landing_url=top_one.get("landing_page_url"),
+        provider_hint=top_one.get("provider_hint"),
+        confidence=top_one["score"],
+        candidates=scored,
+        title=top_one.get("title"),
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Resolve DOI, URL, or title queries.")
+    parser.add_argument("--query", required=True, help="DOI, paper URL, or title query")
+    args = parser.parse_args()
+    print(json.dumps(resolve_query(args.query).to_dict(), indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

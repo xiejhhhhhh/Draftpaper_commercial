@@ -1,0 +1,3 @@
+display_name: DraftPaper Workflow
+short_description: Operate staged DraftPaper CLI projects without bypassing the core Python workflow.
+default_prompt: Use DraftPaper Workflow to create or continue a local research-paper project through literature, plan, writing, LaTeX assembly, PDF review, and quality checks.

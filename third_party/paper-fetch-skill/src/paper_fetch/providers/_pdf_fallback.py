@@ -1,0 +1,691 @@
+"""PDF fallback helpers for browser-workflow and direct-HTTP providers."""
+
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import http.cookiejar
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from ..http import (
+    DEFAULT_FULLTEXT_TIMEOUT_SECONDS,
+    HttpTransport,
+    PDF_ACCEPT_HEADER,
+    RequestFailure,
+)
+from ..http.headers import header_value
+from ..extraction.html.assets.requester import (
+    cookie_header_for_url as _cookie_header_for_url,
+)
+from ..extraction.html.shared import html_text_snippet, html_title_snippet
+from ..extraction.html.signals import detect_html_block, summarize_html
+from ..runtime import RuntimeContext
+from ..runtime_browser import browser_context_options
+from ..utils import normalize_text
+from ._pdf_candidates import extract_pdf_candidate_urls_from_html
+from ._pdf_common import (
+    PdfFetchFailure,
+    PdfFetchResult,
+    filename_from_headers,
+    looks_like_pdf_payload,
+    pdf_fetch_result_from_bytes,
+    sanitize_storage_state,
+)
+
+PdfFallbackResult = PdfFetchResult
+PdfFallbackFailure = PdfFetchFailure
+
+DEFAULT_BROWSER_NAVIGATION_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+)
+
+
+@dataclass(frozen=True)
+class PdfFallbackStrategy:
+    transport: HttpTransport
+    headers: Mapping[str, str] | None = None
+    timeout: int = DEFAULT_FULLTEXT_TIMEOUT_SECONDS
+    artifact_dir: Path | None = None
+    seed_urls: list[str] | None = None
+    browser_cookies: list[dict[str, Any]] | None = None
+    fetcher: Callable[..., PdfFetchResult] | None = None
+
+    def fetch(self, candidate_urls: list[str]) -> PdfFetchResult:
+        fetcher = self.fetcher or fetch_pdf_over_http
+        return fetcher(
+            self.transport,
+            candidate_urls,
+            headers=self.headers,
+            timeout=self.timeout,
+            artifact_dir=self.artifact_dir,
+            seed_urls=self.seed_urls,
+            browser_cookies=self.browser_cookies,
+        )
+
+
+def _pdf_failure_details_from_response(
+    *,
+    source_url: str,
+    final_url: str,
+    status: int | None,
+    headers: Mapping[str, Any] | None,
+    body: bytes | bytearray | None,
+) -> dict[str, Any]:
+    body_bytes = bytes(body or b"") if isinstance(body, (bytes, bytearray)) else b""
+    content_type = header_value(headers, "content-type")
+    title = html_title_snippet(body_bytes)
+    summary = html_text_snippet(body_bytes)
+    details: dict[str, Any] = {
+        "candidate_url": source_url,
+        "source_url": source_url,
+        "final_url": final_url,
+        "status": status,
+        "content_type": content_type,
+        "title_snippet": title,
+        "body_snippet": summary,
+    }
+    detected = detect_html_block(title, summary, status)
+    if detected is not None:
+        details["reason"] = detected.reason
+        details["block_message"] = detected.message
+    elif title or summary:
+        lowered = normalize_text(" ".join([title, summary])).lower()
+        if "temporarily unavailable" in lowered or "temporary unavailable" in lowered:
+            details["reason"] = "publisher_temporary_unavailable"
+        elif "application performance management" in lowered or "apm" in lowered:
+            details["reason"] = "publisher_access_challenge"
+        else:
+            details["reason"] = "non_pdf_html"
+    return {key: value for key, value in details.items() if value not in (None, "")}
+
+
+def _write_pdf_failure_html(artifact_dir: Path | None, body: bytes | bytearray | None) -> None:
+    if artifact_dir is None or not isinstance(body, (bytes, bytearray)) or not body:
+        return
+    text = bytes(body).decode("utf-8", errors="replace")
+    if "<html" not in text.lower() and "<!doctype html" not in text.lower():
+        return
+    try:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "pdf.failure.html").write_text(text, encoding="utf-8")
+    except OSError:
+        return
+
+
+def _build_cookie_seeded_opener(
+    seed_urls: list[str] | None,
+    *,
+    headers: Mapping[str, str],
+    timeout: int,
+    browser_cookies: list[dict[str, Any]] | None = None,
+) -> urllib.request.OpenerDirector | None:
+    normalized_seed_urls = [normalize_text(url) for url in seed_urls or [] if normalize_text(url)]
+    if not normalized_seed_urls and not any(isinstance(cookie, dict) for cookie in browser_cookies or []):
+        return None
+
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    seed_headers = {
+        key: value
+        for key, value in dict(headers).items()
+        if str(key).lower() != "accept"
+    }
+    seed_headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+
+    for seed_url in normalized_seed_urls:
+        request_headers = dict(seed_headers)
+        cookie_header = _cookie_header_for_url(browser_cookies, seed_url)
+        if cookie_header:
+            request_headers["Cookie"] = cookie_header
+        request = urllib.request.Request(seed_url, headers=request_headers)
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                response.read(1024)
+        except Exception:
+            continue
+
+    return opener
+
+
+def _request_with_opener(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    *,
+    headers: Mapping[str, str],
+    timeout: int,
+) -> dict[str, Any]:
+    request = urllib.request.Request(url, headers=dict(headers))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return {
+                "status_code": int(getattr(response, "status", response.getcode())),
+                "headers": {str(key).lower(): str(value) for key, value in response.headers.items()},
+                "body": response.read(),
+                "url": str(response.geturl() or url),
+            }
+    except urllib.error.HTTPError as exc:
+        raise RequestFailure(
+            exc.code,
+            f"HTTP {exc.code} for {url}",
+            body=exc.read(),
+            headers={str(key).lower(): str(value) for key, value in exc.headers.items()},
+            url=str(exc.geturl() or url),
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RequestFailure(
+            None,
+            f"Failed to download PDF fallback candidate: {exc.reason or exc}",
+            url=url,
+        ) from exc
+
+
+def _same_origin(left: str | None, right: str | None) -> bool:
+    left_url = normalize_text(left)
+    right_url = normalize_text(right)
+    if not left_url or not right_url:
+        return False
+    left_parsed = urllib.parse.urlparse(left_url)
+    right_parsed = urllib.parse.urlparse(right_url)
+    return (
+        left_parsed.scheme.lower() == right_parsed.scheme.lower()
+        and normalize_text(left_parsed.hostname).lower()
+        == normalize_text(right_parsed.hostname).lower()
+        and (left_parsed.port or _default_port(left_parsed.scheme))
+        == (right_parsed.port or _default_port(right_parsed.scheme))
+    )
+
+
+def _default_port(scheme: str | None) -> int | None:
+    normalized = normalize_text(scheme).lower()
+    if normalized == "http":
+        return 80
+    if normalized == "https":
+        return 443
+    return None
+
+
+def _browser_navigation_pdf_headers(
+    *,
+    user_agent: str | None,
+    referer: str | None,
+    target_url: str | None,
+) -> dict[str, str]:
+    """Return browser-navigation headers for direct public PDF requests."""
+
+    active_user_agent = normalize_text(user_agent) or DEFAULT_BROWSER_NAVIGATION_USER_AGENT
+    headers = {
+        "User-Agent": active_user_agent,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    active_referer = normalize_text(referer)
+    if active_referer:
+        headers["Referer"] = active_referer
+        headers["Sec-Fetch-Site"] = (
+            "same-origin" if _same_origin(target_url, active_referer) else "cross-site"
+        )
+    else:
+        headers["Sec-Fetch-Site"] = "none"
+    return headers
+
+
+def _response_to_pdf_result(
+    response: Any,
+    *,
+    artifact_dir: Path,
+    source_url: str,
+    final_url: str,
+    page: Any | None = None,
+) -> PdfFetchResult | None:
+    if response is None:
+        return None
+    response_headers = response.headers if response is not None else {}
+    content_type = normalize_text(str(response_headers.get("content-type") or "")).lower()
+    try:
+        response_body = response.body()
+    except Exception as exc:
+        raise PdfFallbackFailure(
+            "pdf_download_failed",
+            f"Failed to read PDF fallback response body: {exc}",
+            details={"source_url": source_url, "final_url": final_url},
+        ) from exc
+    if not looks_like_pdf_payload(content_type, response_body, final_url):
+        return None
+    try:
+        return pdf_fetch_result_from_bytes(
+            artifact_dir=artifact_dir,
+            source_url=source_url,
+            final_url=final_url,
+            pdf_bytes=response_body,
+            suggested_filename=filename_from_headers(response_headers),
+        )
+    except PdfFallbackFailure as exc:
+        if exc.kind != "downloaded_file_not_pdf" or page is None:
+            raise
+        refetched = _refetch_pdf_with_browser_request(
+            page,
+            artifact_dir=artifact_dir,
+            source_url=source_url,
+            final_url=final_url,
+        )
+        if refetched is not None:
+            return refetched
+        raise
+
+
+def _refetch_pdf_with_browser_request(
+    page: Any,
+    *,
+    artifact_dir: Path,
+    source_url: str,
+    final_url: str,
+) -> PdfFetchResult | None:
+    normalized_final_url = normalize_text(final_url)
+    if not normalized_final_url:
+        return None
+    parsed = urllib.parse.urlparse(normalized_final_url)
+    normalized_path = normalize_text(parsed.path).lower()
+    if not (
+        normalized_path.endswith(".pdf")
+        or "/doi/pdf/" in normalized_path
+        or "/doi/epdf/" in normalized_path
+        or "/pdf" in normalized_path
+    ):
+        return None
+    try:
+        response = page.request.get(normalized_final_url, timeout=60000)
+        headers = {str(key).lower(): str(value) for key, value in (response.headers or {}).items()}
+        body = response.body()
+    except Exception as exc:
+        raise PdfFallbackFailure(
+            "pdf_download_failed",
+            f"Failed to refetch PDF fallback response from browser request context: {exc}",
+            details={"source_url": source_url, "final_url": normalized_final_url},
+        ) from exc
+    content_type = normalize_text(str(headers.get("content-type") or "")).lower()
+    if not looks_like_pdf_payload(content_type, body, normalized_final_url):
+        return None
+    return pdf_fetch_result_from_bytes(
+        artifact_dir=artifact_dir,
+        source_url=source_url,
+        final_url=normalized_final_url,
+        pdf_bytes=body,
+        suggested_filename=filename_from_headers(headers),
+    )
+
+
+def _download_to_pdf_result(
+    download: Any,
+    *,
+    artifact_dir: Path,
+    source_url: str,
+    final_url: str,
+) -> PdfFetchResult:
+    download_path = artifact_dir / "downloaded.pdf"
+    download.save_as(str(download_path))
+    return pdf_fetch_result_from_bytes(
+        artifact_dir=artifact_dir,
+        source_url=source_url,
+        final_url=final_url,
+        pdf_bytes=download_path.read_bytes(),
+        suggested_filename=getattr(download, "suggested_filename", None),
+    )
+
+
+def _running_asyncio_loop_active() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def fetch_pdf_with_browser(
+    candidate_urls: list[str],
+    *,
+    artifact_dir: Path,
+    browser_cookies: list[dict[str, Any]] | None = None,
+    browser_user_agent: str | None = None,
+    headless: bool = True,
+    referer: str | None = None,
+    storage_state_path: Path | None = None,
+    seed_urls: list[str] | None = None,
+    context: RuntimeContext | None = None,
+    _allow_thread_handoff: bool = True,
+    _use_runtime_browser: bool = True,
+) -> PdfFallbackResult:
+    if _allow_thread_handoff and _running_asyncio_loop_active():
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(
+                fetch_pdf_with_browser,
+                candidate_urls,
+                artifact_dir=artifact_dir,
+                browser_cookies=browser_cookies,
+                browser_user_agent=browser_user_agent,
+                headless=headless,
+                referer=referer,
+                storage_state_path=storage_state_path,
+                seed_urls=seed_urls,
+                context=context,
+                _allow_thread_handoff=False,
+                _use_runtime_browser=False,
+            ).result()
+
+    if not candidate_urls:
+        raise PdfFallbackFailure("empty_pdf_attempts", "No PDF fallback candidates were attempted.")
+
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    except Exception as exc:  # pragma: no cover - exercised by missing dependency integration tests
+        raise PdfFallbackFailure(
+            "missing_browser_runtime",
+            "browser runtime is not installed; cannot use PDF fallback.",
+        ) from exc
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    last_failure: PdfFallbackFailure | None = None
+    sanitized_storage_state_path: Path | None = None
+    active_user_agent = normalize_text(browser_user_agent)
+    normalized_seed_urls = [
+        normalize_text(url) for url in seed_urls or [] if normalize_text(url)
+    ]
+    seeded_referer = normalize_text(referer) or (
+        normalized_seed_urls[0] if normalized_seed_urls else ""
+    )
+
+    if browser_cookies or normalized_seed_urls:
+        http_headers = _browser_navigation_pdf_headers(
+            user_agent=active_user_agent,
+            referer=seeded_referer,
+            target_url=candidate_urls[0] if candidate_urls else None,
+        )
+        try:
+            return fetch_pdf_over_http(
+                context.transport if context is not None and context.transport is not None else HttpTransport(),
+                candidate_urls,
+                headers=http_headers,
+                timeout=DEFAULT_FULLTEXT_TIMEOUT_SECONDS,
+                artifact_dir=artifact_dir,
+                seed_urls=normalized_seed_urls,
+                browser_cookies=list(browser_cookies or []),
+            )
+        except PdfFallbackFailure as exc:
+            last_failure = exc
+
+    context_kwargs: dict[str, Any] = browser_context_options(
+        user_agent=active_user_agent,
+        accept_downloads=True,
+    )
+    if storage_state_path is not None:
+        sanitized_storage_state_path = sanitize_storage_state(storage_state_path)
+        context_kwargs["storage_state"] = str(sanitized_storage_state_path)
+
+    manager = None
+    browser_context = None
+    try:
+        if context is not None and _use_runtime_browser:
+            browser_context = context.new_browser_context(headless=headless, **context_kwargs)
+        else:
+            from ..runtime_browser import BrowserContextManager
+
+            manager = BrowserContextManager()
+            browser_context = manager.new_context(headless=headless, **context_kwargs)
+
+        if browser_cookies:
+            try:
+                browser_context.add_cookies(browser_cookies)
+            except Exception as exc:
+                raise PdfFallbackFailure(
+                    "invalid_browser_context_seed",
+                    f"Failed to seed browser-context PDF fallback with cookies: {exc}",
+                ) from exc
+
+        page = browser_context.new_page()
+        for seed_url in [normalize_text(url) for url in seed_urls or [] if normalize_text(url)]:
+            try:
+                page.goto(seed_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                continue
+        for url in candidate_urls:
+            initial_response = None
+            goto_kwargs: dict[str, Any] = {
+                "wait_until": "domcontentloaded",
+                "timeout": 60000,
+            }
+            active_referer = normalize_text(referer)
+            if active_referer:
+                goto_kwargs["referer"] = active_referer
+            try:
+                with page.expect_download(timeout=30000) as download_info:
+                    try:
+                        initial_response = page.goto(url, **goto_kwargs)
+                    except PlaywrightError as exc:
+                        if "Download is starting" not in str(exc):
+                            raise
+                download = download_info.value
+            except PlaywrightTimeoutError:
+                response = initial_response
+                if response is None:
+                    try:
+                        response = page.goto(url, **goto_kwargs)
+                    except Exception:
+                        response = None
+                if response is not None:
+                    try:
+                        pdf_result = _response_to_pdf_result(
+                            response,
+                            artifact_dir=artifact_dir,
+                            source_url=url,
+                            final_url=page.url,
+                            page=page,
+                        )
+                        if pdf_result is not None:
+                            return pdf_result
+                    except PdfFallbackFailure as exc:
+                        last_failure = exc
+                        continue
+                title = normalize_text(page.title())
+                html = page.content()
+                current_url = normalize_text(page.url)
+                html_base_url = current_url
+                parsed_current_url = urllib.parse.urlparse(current_url)
+                if parsed_current_url.scheme not in {"http", "https"} or not normalize_text(parsed_current_url.netloc):
+                    html_base_url = url
+                discovered = extract_pdf_candidate_urls_from_html(html, html_base_url)
+                http_retry_candidates: list[str] = []
+                for candidate in [urllib.parse.urljoin(html_base_url or "", url), *discovered]:
+                    normalized_candidate = normalize_text(candidate)
+                    if normalized_candidate and normalized_candidate not in http_retry_candidates:
+                        http_retry_candidates.append(normalized_candidate)
+                if http_retry_candidates:
+                    try:
+                        context_cookies = browser_context.cookies()
+                    except Exception:
+                        context_cookies = list(browser_cookies or [])
+                    http_referer = normalize_text(referer) or normalize_text(html_base_url)
+                    http_headers = _browser_navigation_pdf_headers(
+                        user_agent=active_user_agent,
+                        referer=http_referer,
+                        target_url=http_retry_candidates[0],
+                    )
+                    try:
+                        return fetch_pdf_over_http(
+                            context.transport if context is not None and context.transport is not None else HttpTransport(),
+                            http_retry_candidates,
+                            headers=http_headers,
+                            timeout=DEFAULT_FULLTEXT_TIMEOUT_SECONDS,
+                            artifact_dir=artifact_dir,
+                            browser_cookies=context_cookies,
+                        )
+                    except PdfFallbackFailure as exc:
+                        last_failure = exc
+                summary = summarize_html(html)
+                response_status = None
+                response_headers: Mapping[str, Any] = {}
+                if response is not None:
+                    try:
+                        response_status = int(response.status)
+                    except Exception:
+                        response_status = None
+                    response_headers = getattr(response, "headers", {}) or {}
+                detected = detect_html_block(title, summary, response_status)
+                (artifact_dir / "pdf.failure.html").write_text(html, encoding="utf-8")
+                try:
+                    page.screenshot(path=str(artifact_dir / "pdf.failure.png"), full_page=True)
+                except Exception:
+                    pass
+                failure_details = _pdf_failure_details_from_response(
+                    source_url=url,
+                    final_url=page.url,
+                    status=response_status,
+                    headers=response_headers,
+                    body=html.encode("utf-8", errors="replace"),
+                )
+                last_failure = PdfFallbackFailure(
+                    detected.reason if detected is not None else "pdf_download_not_triggered",
+                    detected.message if detected is not None else "Browser context did not trigger a PDF download.",
+                    details=failure_details or {"source_url": url, "final_url": page.url},
+                )
+                continue
+            except Exception as exc:
+                last_failure = PdfFallbackFailure(
+                    "pdf_download_failed",
+                    f"Failed to trigger PDF fallback download: {exc}",
+                    details={"source_url": url},
+                )
+                continue
+
+            try:
+                return _download_to_pdf_result(
+                    download,
+                    artifact_dir=artifact_dir,
+                    source_url=url,
+                    final_url=page.url,
+                )
+            except PdfFallbackFailure as exc:
+                last_failure = exc
+                continue
+    finally:
+        if browser_context is not None:
+            try:
+                browser_context.close()
+            except Exception:
+                pass
+        if manager is not None:
+            try:
+                manager.close()
+            except Exception:
+                pass
+        if sanitized_storage_state_path is not None:
+            sanitized_storage_state_path.unlink(missing_ok=True)
+
+    if last_failure is None:
+        last_failure = PdfFallbackFailure("empty_pdf_attempts", "No PDF fallback candidates were attempted.")
+    raise last_failure
+
+
+fetch_pdf_with_playwright = fetch_pdf_with_browser
+
+
+def fetch_pdf_over_http(
+    transport: HttpTransport,
+    candidate_urls: list[str],
+    *,
+    headers: Mapping[str, str] | None = None,
+    timeout: int = DEFAULT_FULLTEXT_TIMEOUT_SECONDS,
+    artifact_dir: Path | None = None,
+    seed_urls: list[str] | None = None,
+    browser_cookies: list[dict[str, Any]] | None = None,
+) -> PdfFetchResult:
+    if not candidate_urls:
+        raise PdfFetchFailure("empty_pdf_attempts", "No PDF fallback candidates were attempted.")
+
+    request_headers = {"Accept": PDF_ACCEPT_HEADER, **dict(headers or {})}
+    last_failure: PdfFetchFailure | None = None
+    opener = _build_cookie_seeded_opener(
+        seed_urls,
+        headers=request_headers,
+        timeout=timeout,
+        browser_cookies=browser_cookies,
+    )
+
+    for url in candidate_urls:
+        per_request_headers = dict(request_headers)
+        cookie_header = _cookie_header_for_url(browser_cookies, url)
+        if cookie_header:
+            per_request_headers["Cookie"] = cookie_header
+        try:
+            response = (
+                _request_with_opener(opener, url, headers=per_request_headers, timeout=timeout)
+                if opener is not None
+                else transport.request(
+                    "GET",
+                    url,
+                    headers=per_request_headers,
+                    timeout=timeout,
+                    retry_on_transient=True,
+                )
+            )
+        except RequestFailure as exc:
+            details = _pdf_failure_details_from_response(
+                source_url=url,
+                final_url=str(exc.url or url),
+                status=exc.status_code,
+                headers=exc.headers,
+                body=exc.body,
+            )
+            _write_pdf_failure_html(artifact_dir, exc.body)
+            last_failure = PdfFetchFailure(
+                "pdf_download_failed",
+                f"Failed to download PDF fallback candidate: {exc}",
+                details=details or {"source_url": url},
+            )
+            continue
+
+        final_url = str(response.get("url") or url)
+        response_headers = response.get("headers") or {}
+        pdf_bytes = response.get("body", b"")
+        content_type = header_value(response_headers, "content-type")
+        if not isinstance(pdf_bytes, (bytes, bytearray)) or not looks_like_pdf_payload(
+            content_type,
+            bytes(pdf_bytes),
+            final_url,
+        ):
+            body_bytes = bytes(pdf_bytes) if isinstance(pdf_bytes, (bytes, bytearray)) else b""
+            _write_pdf_failure_html(artifact_dir, body_bytes)
+            last_failure = PdfFetchFailure(
+                "downloaded_file_not_pdf",
+                "Direct PDF fallback candidate did not return a PDF file.",
+                details=_pdf_failure_details_from_response(
+                    source_url=url,
+                    final_url=final_url,
+                    status=int(response.get("status_code") or 0) or None,
+                    headers=response_headers,
+                    body=body_bytes,
+                ),
+            )
+            continue
+
+        try:
+            return pdf_fetch_result_from_bytes(
+                artifact_dir=artifact_dir,
+                source_url=url,
+                final_url=final_url,
+                pdf_bytes=bytes(pdf_bytes),
+                suggested_filename=filename_from_headers(response_headers),
+            )
+        except PdfFetchFailure as exc:
+            last_failure = exc
+            continue
+
+    if last_failure is None:
+        last_failure = PdfFetchFailure("empty_pdf_attempts", "No PDF fallback candidates were attempted.")
+    raise last_failure

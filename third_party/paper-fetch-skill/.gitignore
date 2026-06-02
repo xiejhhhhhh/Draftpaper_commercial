@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+
+# Local tool installs
+.formula-tools/
+.formula-benchmarks/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+pip-wheel-metadata/
+rollout-*.jsonl
+*.local.md
+
+# Project-local agent installs
+.codex
+.codex/
+.claude/
+
+# Secrets and local data
+.env
+live-downloads/
+.paper-fetch/
+.paper-fetch-runs/
+figures/.paper-fetch-mcp-cache.json
+problems.md
+problems_doc.md
+agent-surface-plan.md
+docs/pm-dev-overview.local.md
+onboarding/onboarding-state.json
+legacy/flaresolverr/
+todo.md
+publisher-provider-todo.md
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

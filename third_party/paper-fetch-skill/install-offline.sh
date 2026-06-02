@@ -1,0 +1,949 @@
+#!/usr/bin/env bash
+# Offline installer for CPython ABI-specific Linux/macOS runtime payloads.
+
+set -euo pipefail
+
+BUNDLE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="${PAPER_FETCH_OFFLINE_PYTHON_BIN:-python3}"
+PRESET="headless"
+MERGE_USER_CONFIG=0
+RUN_SMOKE=1
+UNINSTALL=0
+PURGE=0
+INSTALL_ROOT=""
+OFFLINE_ENV_FILE=""
+REUSE_ENV_FILE=0
+INSTALLER_MANIFEST_FILE=""
+
+MANAGED_BEGIN="# BEGIN paper-fetch offline managed"
+MANAGED_END="# END paper-fetch offline managed"
+CODEX_MANAGED_BEGIN="# BEGIN paper-fetch installer managed"
+CODEX_MANAGED_END="# END paper-fetch installer managed"
+SKILL_NAME="paper-fetch-skill"
+MCP_NAME="paper-fetch"
+MCP_ENV_KEYS=(
+  PYTHONUTF8
+  PYTHONIOENCODING
+  PAPER_FETCH_ENV_FILE
+  PAPER_FETCH_DOWNLOAD_DIR
+  PAPER_FETCH_FORMULA_TOOLS_DIR
+  CLOAKBROWSER_HEADLESS
+)
+
+log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+
+load_installer_manifest() {
+  INSTALLER_MANIFEST_FILE="$BUNDLE_ROOT/installer/manifest.json"
+  if [ ! -f "$INSTALLER_MANIFEST_FILE" ] && [ -n "$INSTALL_ROOT" ]; then
+    INSTALLER_MANIFEST_FILE="$INSTALL_ROOT/installer/manifest.json"
+  fi
+  if [ ! -f "$INSTALLER_MANIFEST_FILE" ]; then
+    if [ "$UNINSTALL" = "1" ] || [ "$PURGE" = "1" ]; then
+      return 0
+    fi
+    die "Missing installer manifest: $INSTALLER_MANIFEST_FILE"
+  fi
+  if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    if [ "$UNINSTALL" = "1" ] || [ "$PURGE" = "1" ]; then
+      return 0
+    fi
+    die "$PYTHON_BIN was not found on PATH; cannot read installer manifest."
+  fi
+
+  local values=()
+  local value
+  while IFS= read -r value; do
+    values+=("$value")
+  done < <("$PYTHON_BIN" -c '
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+print("installer_manifest_values")
+print(manifest["managed_blocks"]["offline"]["begin"])
+print(manifest["managed_blocks"]["offline"]["end"])
+print(manifest["managed_blocks"]["codex"]["begin"])
+print(manifest["managed_blocks"]["codex"]["end"])
+print(manifest["skill"]["name"])
+print(manifest["mcp"]["name"])
+for key in manifest["mcp"]["env_keys"]:
+    print(key)
+' "$INSTALLER_MANIFEST_FILE")
+
+  [ "${values[0]:-}" = "installer_manifest_values" ] || die "Invalid installer manifest payload from $INSTALLER_MANIFEST_FILE"
+  MANAGED_BEGIN="${values[1]:-}"
+  MANAGED_END="${values[2]:-}"
+  CODEX_MANAGED_BEGIN="${values[3]:-}"
+  CODEX_MANAGED_END="${values[4]:-}"
+  SKILL_NAME="${values[5]:-}"
+  MCP_NAME="${values[6]:-}"
+  MCP_ENV_KEYS=("${values[@]:7}")
+  normalize_mcp_env_keys
+
+  [ -n "$MANAGED_BEGIN" ] || die "installer manifest is missing managed_blocks.offline.begin"
+  [ -n "$MANAGED_END" ] || die "installer manifest is missing managed_blocks.offline.end"
+  [ -n "$CODEX_MANAGED_BEGIN" ] || die "installer manifest is missing managed_blocks.codex.begin"
+  [ -n "$CODEX_MANAGED_END" ] || die "installer manifest is missing managed_blocks.codex.end"
+  [ -n "$SKILL_NAME" ] || die "installer manifest is missing skill.name"
+  [ -n "$MCP_NAME" ] || die "installer manifest is missing mcp.name"
+  [ "${#MCP_ENV_KEYS[@]}" -gt 0 ] || die "installer manifest is missing mcp.env_keys"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./install-offline.sh [--install-dir <path>] [--preset=headless|headful] [--user-config] [--reuse-env-file <path>]
+  ./install-offline.sh [--install-dir <path>] --uninstall
+  ./install-offline.sh [--install-dir <path>] --purge
+
+Options:
+  --install-dir <path>    Install runtime files here. Default: ~/.local/share/paper-fetch-skill.
+  --preset=headless|headful
+                            Select CloakBrowser headless/headful runtime env. Default: headless.
+  --user-config           Also merge the offline runtime block into ~/.config/paper-fetch/.env.
+  --no-user-config        Do not touch ~/.config/paper-fetch/.env. This is the default.
+  --reuse-env-file <path> Use an existing offline.env without modifying it.
+  --skip-smoke            Skip local command smoke checks after installation.
+  --uninstall             Remove user-level shell, skill, and MCP integration without deleting the install directory.
+  --purge                 Remove user-level integration and delete the install directory.
+  -h, --help              Show this help.
+
+Environment:
+  CLOAKBROWSER_HEADLESS     Set to false for a headful CloakBrowser runtime.
+  CLOAKBROWSER_BINARY_PATH  Optional path to a preinstalled browser binary; when set,
+                            CloakBrowser runtime download is skipped.
+EOF
+}
+
+normalize_mcp_env_keys() {
+  local key seen_headless=0
+  local filtered=()
+  for key in "${MCP_ENV_KEYS[@]}"; do
+    case "$key" in
+      PLAYWRIGHT_BROWSERS_PATH)
+        continue
+        ;;
+      CLOAKBROWSER_HEADLESS)
+        seen_headless=1
+        ;;
+    esac
+    filtered+=("$key")
+  done
+  if [ "$seen_headless" != "1" ]; then
+    filtered+=(CLOAKBROWSER_HEADLESS)
+  fi
+  MCP_ENV_KEYS=("${filtered[@]}")
+}
+
+normalize_path() {
+  local value="$1"
+  case "$value" in
+    "~")
+      [ -n "${HOME:-}" ] || die "HOME is required to expand ~."
+      printf '%s\n' "$HOME"
+      ;;
+    "~/"*)
+      [ -n "${HOME:-}" ] || die "HOME is required to expand ~."
+      printf '%s/%s\n' "$HOME" "${value#~/}"
+      ;;
+    /*)
+      printf '%s\n' "$value"
+      ;;
+    *)
+      printf '%s/%s\n' "$(pwd)" "$value"
+      ;;
+  esac
+}
+
+while (($#)); do
+  case "$1" in
+    --install-dir=*)
+      INSTALL_ROOT="$(normalize_path "${1#*=}")"
+      ;;
+    --install-dir)
+      shift
+      [ "$#" -gt 0 ] || die "--install-dir requires a path"
+      INSTALL_ROOT="$(normalize_path "$1")"
+      ;;
+    --preset=*)
+      PRESET="${1#*=}"
+      ;;
+    --preset)
+      shift
+      [ "$#" -gt 0 ] || die "--preset requires headless or headful"
+      PRESET="$1"
+      ;;
+    --user-config)
+      MERGE_USER_CONFIG=1
+      ;;
+    --no-user-config)
+      MERGE_USER_CONFIG=0
+      ;;
+    --reuse-env-file=*)
+      OFFLINE_ENV_FILE="$(normalize_path "${1#*=}")"
+      REUSE_ENV_FILE=1
+      ;;
+    --reuse-env-file)
+      shift
+      [ "$#" -gt 0 ] || die "--reuse-env-file requires a path"
+      OFFLINE_ENV_FILE="$(normalize_path "$1")"
+      REUSE_ENV_FILE=1
+      ;;
+    --skip-smoke)
+      RUN_SMOKE=0
+      ;;
+    --uninstall)
+      UNINSTALL=1
+      ;;
+    --purge)
+      UNINSTALL=1
+      PURGE=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "Unknown option: $1"
+      ;;
+  esac
+  shift
+done
+
+if [ -z "$INSTALL_ROOT" ]; then
+  [ -n "${HOME:-}" ] || die "HOME is required for the default install directory."
+  INSTALL_ROOT="$HOME/.local/share/paper-fetch-skill"
+fi
+
+if [ "$REUSE_ENV_FILE" != "1" ]; then
+  OFFLINE_ENV_FILE="$INSTALL_ROOT/offline.env"
+fi
+
+if [ "$UNINSTALL" != "1" ]; then
+  case "$PRESET" in
+    headless|headful) ;;
+    *) die "--preset must be headless or headful" ;;
+  esac
+  if [ "$REUSE_ENV_FILE" = "1" ]; then
+    [ -f "$OFFLINE_ENV_FILE" ] || die "Missing reusable offline env file: $OFFLINE_ENV_FILE"
+  fi
+fi
+
+require_file() {
+  [ -f "$1" ] || die "Missing required bundled file: $1"
+}
+
+require_dir() {
+  [ -d "$1" ] || die "Missing required bundled directory: $1"
+}
+
+quote_env_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\$}"
+  value="${value//\`/\\\`}"
+  printf '"%s"' "$value"
+}
+
+quote_toml_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+mcp_name_regex() {
+  printf '%s' "$MCP_NAME" | sed 's/[][\\.^$*+?{}|()]/\\&/g'
+}
+
+offline_manifest_value() {
+  "$PYTHON_BIN" -c '
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+value = data
+for part in sys.argv[2].split("."):
+    value = value.get(part, "") if isinstance(value, dict) else ""
+print(value)
+' "$BUNDLE_ROOT/offline-manifest.json" "$1"
+}
+
+host_platform() {
+  case "$(uname -s)" in
+    Linux) printf 'linux\n' ;;
+    Darwin) printf 'macos\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+host_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'x86_64\n' ;;
+    arm64|aarch64) printf 'arm64\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || true
+}
+
+check_platform() {
+  require_file "$BUNDLE_ROOT/offline-manifest.json"
+
+  local platform arch manifest_platform manifest_arch
+  platform="$(host_platform)" || die "This offline bundle supports Linux and macOS only; detected $(uname -s)."
+  arch="$(host_arch)" || die "This offline bundle supports x86_64 and arm64 only; detected $(uname -m)."
+  manifest_platform="$(offline_manifest_value target.platform)"
+  manifest_arch="$(offline_manifest_value target.arch)"
+  [ -n "$manifest_platform" ] || die "offline-manifest.json is missing target.platform."
+  [ -n "$manifest_arch" ] || die "offline-manifest.json is missing target.arch."
+
+  case "$platform:$arch" in
+    linux:x86_64|macos:x86_64|macos:arm64) ;;
+    linux:arm64) die "Linux offline bundles currently support x86_64 only; detected arm64." ;;
+    *) die "Unsupported offline target host: $platform/$arch." ;;
+  esac
+
+  [ "$platform" = "$manifest_platform" ] || die "bundle targets $manifest_platform; detected $platform."
+  [ "$arch" = "$manifest_arch" ] || die "bundle targets $manifest_arch; detected $arch."
+}
+
+check_python() {
+  command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "python3 was not found on PATH."
+  require_file "$BUNDLE_ROOT/offline-manifest.json"
+
+  local version tag manifest_tag
+  version="$("$PYTHON_BIN" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
+  tag="$("$PYTHON_BIN" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}" if sys.implementation.name == "cpython" else sys.implementation.name)')"
+  manifest_tag="$("$PYTHON_BIN" -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("target", {}).get("python_tag", ""))' "$BUNDLE_ROOT/offline-manifest.json")"
+  [ -n "$manifest_tag" ] || die "offline-manifest.json is missing target.python_tag."
+  [ "$tag" = "$manifest_tag" ] || die "bundle requires CPython $manifest_tag; detected Python $version ($tag)."
+}
+
+write_runtime_python_file() {
+  local resolved_python
+  resolved_python="$(command -v "$PYTHON_BIN")"
+  mkdir -p "$INSTALL_ROOT/runtime"
+  printf '%s\n' "$resolved_python" > "$INSTALL_ROOT/runtime/python-bin"
+}
+
+verify_checksums() {
+  require_file "$BUNDLE_ROOT/sha256sums.txt"
+  log "Verifying bundled file checksums"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$BUNDLE_ROOT" && sha256sum --check sha256sums.txt --quiet)
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$BUNDLE_ROOT" && shasum -a 256 --check sha256sums.txt >/dev/null)
+  else
+    die "sha256sum or shasum is required to verify the offline bundle."
+  fi
+}
+
+check_preset_requirements() {
+  host_platform >/dev/null || die "This offline bundle supports Linux and macOS only; detected $(uname -s)."
+}
+
+cloakbrowser_headless_value() {
+  if [ "$PRESET" = "headful" ]; then
+    printf 'false\n'
+  else
+    printf 'true\n'
+  fi
+}
+
+check_bundle_assets() {
+  require_dir "$BUNDLE_ROOT/runtime/site-packages"
+  require_file "$BUNDLE_ROOT/runtime/site-packages/paper_fetch/__init__.py"
+  require_file "$BUNDLE_ROOT/runtime/paper-fetch-python"
+  require_file "$BUNDLE_ROOT/bin/paper-fetch"
+  require_file "$BUNDLE_ROOT/bin/paper-fetch-mcp"
+  require_file "$BUNDLE_ROOT/bin/paper-fetch-install-formula-tools"
+  [ -x "$BUNDLE_ROOT/runtime/paper-fetch-python" ] || die "Bundled private Python launcher is not executable: $BUNDLE_ROOT/runtime/paper-fetch-python"
+  [ -x "$BUNDLE_ROOT/bin/paper-fetch" ] || die "Bundled CLI wrapper is not executable: $BUNDLE_ROOT/bin/paper-fetch"
+  [ -x "$BUNDLE_ROOT/bin/paper-fetch-mcp" ] || die "Bundled MCP wrapper is not executable: $BUNDLE_ROOT/bin/paper-fetch-mcp"
+  [ -x "$BUNDLE_ROOT/bin/paper-fetch-install-formula-tools" ] || die "Bundled formula installer wrapper is not executable: $BUNDLE_ROOT/bin/paper-fetch-install-formula-tools"
+  require_file "$BUNDLE_ROOT/formula-tools/bin/texmath"
+  [ -x "$BUNDLE_ROOT/formula-tools/bin/texmath" ] || die "Bundled texmath is not executable: $BUNDLE_ROOT/formula-tools/bin/texmath"
+
+  require_file "$BUNDLE_ROOT/skills/$SKILL_NAME/SKILL.md"
+}
+
+mcp_python_bin() {
+  printf '%s\n' "$INSTALL_ROOT/runtime/paper-fetch-python"
+}
+
+mathml_node_bin() {
+  local bundled_node="$INSTALL_ROOT/runtime/site-packages/playwright/driver/node"
+  if [ -x "$bundled_node" ]; then
+    printf '%s\n' "$bundled_node"
+  else
+    command -v node || printf 'node\n'
+  fi
+}
+
+mcp_env_value() {
+  local key="$1"
+  case "$key" in
+    PYTHONUTF8) printf '1\n' ;;
+    PYTHONIOENCODING) printf 'utf-8\n' ;;
+    PAPER_FETCH_ENV_FILE) printf '%s\n' "$OFFLINE_ENV_FILE" ;;
+    PAPER_FETCH_DOWNLOAD_DIR) printf '%s\n' "$INSTALL_ROOT/downloads" ;;
+    PAPER_FETCH_FORMULA_TOOLS_DIR) printf '%s\n' "$INSTALL_ROOT/formula-tools" ;;
+    MATHML_TO_LATEX_NODE_BIN) mathml_node_bin ;;
+    CLOAKBROWSER_HEADLESS) cloakbrowser_headless_value ;;
+    *) die "Unknown MCP env key: $key" ;;
+  esac
+}
+
+copy_installed_skill() {
+  local destination="$1"
+  local source="$INSTALL_ROOT/skills/$SKILL_NAME"
+
+  require_file "$source/SKILL.md"
+  rm -rf "$destination"
+  mkdir -p "$destination"
+  cp -a "$source/." "$destination/"
+}
+
+install_skills() {
+  [ -n "${HOME:-}" ] || die "HOME is required to install Codex and Claude skills."
+
+  local codex_skill="$HOME/.codex/skills/$SKILL_NAME"
+  local claude_skill="$HOME/.claude/skills/$SKILL_NAME"
+
+  log "Installing Codex skill to $codex_skill"
+  copy_installed_skill "$codex_skill"
+  log "Installing Claude Code skill to $claude_skill"
+  copy_installed_skill "$claude_skill"
+}
+
+select_shell_startup_file() {
+  [ -n "${HOME:-}" ] || die "HOME is required to update shell startup files."
+
+  SHELL_STARTUP_STYLE="posix"
+  case "$(basename "${SHELL:-}")" in
+    bash)
+      SHELL_STARTUP_TARGET="$HOME/.bashrc"
+      ;;
+    zsh)
+      SHELL_STARTUP_TARGET="$HOME/.zshrc"
+      ;;
+    fish)
+      SHELL_STARTUP_TARGET="$HOME/.config/fish/conf.d/paper-fetch-offline.fish"
+      SHELL_STARTUP_STYLE="fish"
+      ;;
+    *)
+      SHELL_STARTUP_TARGET="$HOME/.profile"
+      warn "Unrecognized SHELL=${SHELL:-}; writing offline environment to $SHELL_STARTUP_TARGET"
+      ;;
+  esac
+}
+
+write_posix_shell_block() {
+  printf '%s\n' "$MANAGED_BEGIN"
+  printf 'export PATH=%s:%s:$PATH\n' "$(quote_env_value "$INSTALL_ROOT/bin")" "$(quote_env_value "$INSTALL_ROOT/formula-tools/bin")"
+  printf 'export PAPER_FETCH_ENV_FILE=%s\n' "$(quote_env_value "$OFFLINE_ENV_FILE")"
+  printf 'export PAPER_FETCH_DOWNLOAD_DIR=%s\n' "$(quote_env_value "$INSTALL_ROOT/downloads")"
+  printf 'export PAPER_FETCH_FORMULA_TOOLS_DIR=%s\n' "$(quote_env_value "$INSTALL_ROOT/formula-tools")"
+  printf 'export CLOAKBROWSER_HEADLESS=%s\n' "$(quote_env_value "$(cloakbrowser_headless_value)")"
+  printf '%s\n' "$MANAGED_END"
+}
+
+write_fish_shell_block() {
+  printf '%s\n' "$MANAGED_BEGIN"
+  printf 'set -gx PATH %s %s $PATH\n' "$(quote_env_value "$INSTALL_ROOT/bin")" "$(quote_env_value "$INSTALL_ROOT/formula-tools/bin")"
+  printf 'set -gx PAPER_FETCH_ENV_FILE %s\n' "$(quote_env_value "$OFFLINE_ENV_FILE")"
+  printf 'set -gx PAPER_FETCH_DOWNLOAD_DIR %s\n' "$(quote_env_value "$INSTALL_ROOT/downloads")"
+  printf 'set -gx PAPER_FETCH_FORMULA_TOOLS_DIR %s\n' "$(quote_env_value "$INSTALL_ROOT/formula-tools")"
+  printf 'set -gx CLOAKBROWSER_HEADLESS %s\n' "$(quote_env_value "$(cloakbrowser_headless_value)")"
+  printf '%s\n' "$MANAGED_END"
+}
+
+write_shell_startup_file() {
+  local tmp mode
+
+  select_shell_startup_file
+  tmp="$(mktemp)"
+  mode=""
+  mkdir -p "$(dirname "$SHELL_STARTUP_TARGET")"
+  if [ -f "$SHELL_STARTUP_TARGET" ]; then
+    mode="$(file_mode "$SHELL_STARTUP_TARGET")"
+    awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '
+      $0 == begin { skip = 1; next }
+      $0 == end { skip = 0; next }
+      !skip { print }
+    ' "$SHELL_STARTUP_TARGET" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+
+  {
+    printf '\n'
+    if [ "$SHELL_STARTUP_STYLE" = "fish" ]; then
+      write_fish_shell_block
+    else
+      write_posix_shell_block
+    fi
+  } >> "$tmp"
+
+  mv "$tmp" "$SHELL_STARTUP_TARGET"
+  if [ -n "$mode" ]; then
+    chmod "$mode" "$SHELL_STARTUP_TARGET"
+  fi
+  log "Updated shell startup file at $SHELL_STARTUP_TARGET"
+}
+
+write_codex_config_toml() {
+  [ -n "${HOME:-}" ] || die "HOME is required to update Codex MCP config."
+
+  local codex_home="$HOME/.codex"
+  local config_path="$codex_home/config.toml"
+  local tmp key mcp_table_re
+  tmp="$(mktemp)"
+  mcp_table_re="^[[:space:]]*[[]mcp_servers[.]$(mcp_name_regex)([.].*)?[]][[:space:]]*$"
+  mkdir -p "$codex_home"
+
+  if [ -f "$config_path" ]; then
+    awk -v begin="$CODEX_MANAGED_BEGIN" -v end="$CODEX_MANAGED_END" -v old_begin="$MANAGED_BEGIN" -v old_end="$MANAGED_END" -v mcp_table_re="$mcp_table_re" '
+      $0 == begin || $0 == old_begin { skip_block = 1; next }
+      $0 == end || $0 == old_end { skip_block = 0; next }
+      skip_block { next }
+      $0 ~ mcp_table_re { skip_table = 1; next }
+      skip_table && $0 ~ /^[[:space:]]*\[/ { skip_table = 0 }
+      !skip_table { print }
+    ' "$config_path" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+
+  {
+    printf '\n%s\n' "$CODEX_MANAGED_BEGIN"
+    printf '[mcp_servers.%s]\n' "$MCP_NAME"
+    printf 'command = %s\n' "$(quote_toml_value "$(mcp_python_bin)")"
+    printf 'args = ["-X", "utf8", "-m", "paper_fetch.mcp.server"]\n'
+    printf '\n[mcp_servers.%s.env]\n' "$MCP_NAME"
+    for key in "${MCP_ENV_KEYS[@]}"; do
+      printf '%s = %s\n' "$key" "$(quote_toml_value "$(mcp_env_value "$key")")"
+    done
+    printf '%s\n' "$CODEX_MANAGED_END"
+  } >> "$tmp"
+
+  mv "$tmp" "$config_path"
+  log "Updated Codex MCP config at $config_path"
+}
+
+register_codex_mcp() {
+  local codex_bin key
+  codex_bin="$(command -v codex || true)"
+
+  if [ -n "$codex_bin" ]; then
+    log "Registering Codex MCP server '$MCP_NAME' with Codex CLI"
+    "$codex_bin" mcp remove "$MCP_NAME" >/dev/null 2>&1 || true
+
+    local args=(mcp add)
+    for key in "${MCP_ENV_KEYS[@]}"; do
+      args+=(--env "$key=$(mcp_env_value "$key")")
+    done
+    args+=("$MCP_NAME" -- "$(mcp_python_bin)" -X utf8 -m paper_fetch.mcp.server)
+
+    if "$codex_bin" "${args[@]}"; then
+      return
+    fi
+    warn "Codex CLI MCP registration failed; falling back to $HOME/.codex/config.toml"
+  fi
+
+  write_codex_config_toml
+}
+
+register_claude_mcp() {
+  local claude_bin key
+  claude_bin="$(command -v claude || true)"
+
+  if [ -z "$claude_bin" ]; then
+    log "Claude CLI not found; installed the skill and skipped Claude MCP registration"
+    return
+  fi
+
+  log "Registering Claude MCP server '$MCP_NAME' with Claude CLI"
+  "$claude_bin" mcp remove -s user "$MCP_NAME" >/dev/null 2>&1 || true
+
+  local args=(mcp add -s user)
+  for key in "${MCP_ENV_KEYS[@]}"; do
+    args+=(-e "$key=$(mcp_env_value "$key")")
+  done
+  args+=(-- "$MCP_NAME" "$(mcp_python_bin)" -X utf8 -m paper_fetch.mcp.server)
+
+  if ! "$claude_bin" "${args[@]}"; then
+    warn "Claude MCP registration failed and was skipped."
+  fi
+}
+
+remove_managed_block_from_file() {
+  local target="$1"
+  local remove_if_empty="${2:-0}"
+  local tmp mode
+
+  [ -f "$target" ] || return 0
+  tmp="$(mktemp)"
+  mode="$(file_mode "$target")"
+  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '
+    $0 == begin { skip = 1; next }
+    $0 == end { skip = 0; next }
+    !skip { print }
+  ' "$target" > "$tmp"
+
+  if [ "$remove_if_empty" = "1" ] && ! grep -q '[^[:space:]]' "$tmp"; then
+    rm -f "$tmp" "$target"
+    log "Removed empty managed file $target"
+    return 0
+  fi
+
+  mv "$tmp" "$target"
+  if [ -n "$mode" ]; then
+    chmod "$mode" "$target"
+  fi
+  log "Removed managed shell block from $target"
+}
+
+remove_shell_startup_blocks() {
+  [ -n "${HOME:-}" ] || die "HOME is required for --uninstall."
+
+  remove_managed_block_from_file "$HOME/.bashrc"
+  remove_managed_block_from_file "$HOME/.zshrc"
+  remove_managed_block_from_file "$HOME/.profile"
+  remove_managed_block_from_file "$HOME/.config/fish/conf.d/paper-fetch-offline.fish" 1
+}
+
+remove_installed_skills() {
+  [ -n "${HOME:-}" ] || die "HOME is required for --uninstall."
+
+  local codex_skill="$HOME/.codex/skills/$SKILL_NAME"
+  local claude_skill="$HOME/.claude/skills/$SKILL_NAME"
+
+  rm -rf "$codex_skill" "$claude_skill"
+  log "Removed Codex skill at $codex_skill"
+  log "Removed Claude Code skill at $claude_skill"
+}
+
+remove_codex_config_toml() {
+  [ -n "${HOME:-}" ] || die "HOME is required for --uninstall."
+
+  local config_path="$HOME/.codex/config.toml"
+  local tmp mode mcp_table_re
+  [ -f "$config_path" ] || return 0
+
+  tmp="$(mktemp)"
+  mode="$(file_mode "$config_path")"
+  mcp_table_re="^[[:space:]]*[[]mcp_servers[.]$(mcp_name_regex)([.].*)?[]][[:space:]]*$"
+  awk -v begin="$CODEX_MANAGED_BEGIN" -v end="$CODEX_MANAGED_END" -v old_begin="$MANAGED_BEGIN" -v old_end="$MANAGED_END" -v mcp_table_re="$mcp_table_re" '
+    $0 == begin || $0 == old_begin { skip_block = 1; next }
+    $0 == end || $0 == old_end { skip_block = 0; next }
+    skip_block { next }
+    $0 ~ mcp_table_re { skip_table = 1; next }
+    skip_table && $0 ~ /^[[:space:]]*\[/ { skip_table = 0 }
+    !skip_table { print }
+  ' "$config_path" > "$tmp"
+
+  mv "$tmp" "$config_path"
+  if [ -n "$mode" ]; then
+    chmod "$mode" "$config_path"
+  fi
+  log "Removed Codex MCP config from $config_path"
+}
+
+unregister_codex_mcp() {
+  local codex_bin
+  codex_bin="$(command -v codex || true)"
+  if [ -n "$codex_bin" ]; then
+    log "Removing Codex MCP server '$MCP_NAME' with Codex CLI"
+    "$codex_bin" mcp remove "$MCP_NAME" >/dev/null 2>&1 || true
+  fi
+  remove_codex_config_toml
+}
+
+unregister_claude_mcp() {
+  local claude_bin
+  claude_bin="$(command -v claude || true)"
+  if [ -n "$claude_bin" ]; then
+    log "Removing Claude MCP server '$MCP_NAME' with Claude CLI"
+    "$claude_bin" mcp remove -s user "$MCP_NAME" >/dev/null 2>&1 || true
+  else
+    log "Claude CLI not found; skipped Claude MCP removal"
+  fi
+}
+
+uninstall_user_integrations() {
+  remove_installed_skills
+  remove_shell_startup_blocks
+  unregister_codex_mcp
+  unregister_claude_mcp
+
+  echo
+  echo "Offline user-level integration removed."
+  echo "Install directory was left in place: $INSTALL_ROOT"
+}
+
+purge_install_root() {
+  [ -n "$INSTALL_ROOT" ] || die "INSTALL_ROOT is required for --purge."
+  case "$INSTALL_ROOT" in
+    /|"") die "Refusing to purge unsafe install directory: $INSTALL_ROOT" ;;
+  esac
+  rm -rf "$INSTALL_ROOT"
+  echo "Install directory deleted: $INSTALL_ROOT"
+}
+
+write_managed_env_file() {
+  local target="$1"
+  local tmp
+  tmp="$(mktemp)"
+
+  mkdir -p "$(dirname "$target")"
+  if [ -f "$target" ]; then
+    awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '
+      $0 == begin { skip = 1; next }
+      $0 == end { skip = 0; next }
+      !skip { print }
+    ' "$target" > "$tmp"
+  elif [ -f "$INSTALL_ROOT/.env.example" ]; then
+    cp "$INSTALL_ROOT/.env.example" "$tmp"
+  else
+    : > "$tmp"
+  fi
+
+  {
+    printf '\n%s\n' "$MANAGED_BEGIN"
+    printf 'PAPER_FETCH_DOWNLOAD_DIR=%s\n' "$(quote_env_value "$INSTALL_ROOT/downloads")"
+    printf 'PAPER_FETCH_FORMULA_TOOLS_DIR=%s\n' "$(quote_env_value "$INSTALL_ROOT/formula-tools")"
+    printf 'CLOAKBROWSER_HEADLESS=%s\n' "$(quote_env_value "$(cloakbrowser_headless_value)")"
+    printf 'PAPER_FETCH_BROWSER_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"\n'
+    printf '# CLOAKBROWSER_BINARY_PATH="/absolute/path/to/preinstalled/browser"\n'
+    printf '%s\n' "$MANAGED_END"
+  } >> "$tmp"
+
+  mv "$tmp" "$target"
+}
+
+write_activate_script() {
+  local target="$INSTALL_ROOT/activate-offline.sh"
+  local offline_env_literal target_tmp
+
+  if [ "$REUSE_ENV_FILE" = "1" ]; then
+    offline_env_literal="$(quote_env_value "$OFFLINE_ENV_FILE")"
+    cat > "$target" <<EOF
+#!/usr/bin/env bash
+
+if [ -n "\${BASH_SOURCE:-}" ]; then
+  PAPER_FETCH_ACTIVATE_SCRIPT="\${BASH_SOURCE[0]}"
+elif [ -n "\${ZSH_VERSION:-}" ]; then
+  PAPER_FETCH_ACTIVATE_SCRIPT="\${(%):-%x}"
+else
+  PAPER_FETCH_ACTIVATE_SCRIPT="\$0"
+fi
+INSTALL_ROOT="\$(cd "\$(dirname "\$PAPER_FETCH_ACTIVATE_SCRIPT")" && pwd)"
+unset PAPER_FETCH_ACTIVATE_SCRIPT
+export PAPER_FETCH_ENV_FILE=$offline_env_literal
+
+if [ -f "\$PAPER_FETCH_ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "\$PAPER_FETCH_ENV_FILE"
+  set +a
+fi
+
+export PATH="\$INSTALL_ROOT/bin:\$INSTALL_ROOT/formula-tools/bin:\$PATH"
+export PYTHONPATH="\$INSTALL_ROOT/runtime/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
+export PAPER_FETCH_ENV_FILE=$offline_env_literal
+export PAPER_FETCH_DOWNLOAD_DIR="\$INSTALL_ROOT/downloads"
+export PAPER_FETCH_FORMULA_TOOLS_DIR="\$INSTALL_ROOT/formula-tools"
+export CLOAKBROWSER_HEADLESS="\${CLOAKBROWSER_HEADLESS:-$(cloakbrowser_headless_value)}"
+export PYTHONUTF8="\${PYTHONUTF8:-1}"
+export PYTHONIOENCODING="\${PYTHONIOENCODING:-utf-8}"
+EOF
+  else
+    cat > "$target" <<'EOF'
+#!/usr/bin/env bash
+
+if [ -n "${BASH_SOURCE:-}" ]; then
+  PAPER_FETCH_ACTIVATE_SCRIPT="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION:-}" ]; then
+  PAPER_FETCH_ACTIVATE_SCRIPT="${(%):-%x}"
+else
+  PAPER_FETCH_ACTIVATE_SCRIPT="$0"
+fi
+INSTALL_ROOT="$(cd "$(dirname "$PAPER_FETCH_ACTIVATE_SCRIPT")" && pwd)"
+unset PAPER_FETCH_ACTIVATE_SCRIPT
+export PAPER_FETCH_ENV_FILE="${PAPER_FETCH_ENV_FILE:-$INSTALL_ROOT/offline.env}"
+
+if [ -f "$PAPER_FETCH_ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$PAPER_FETCH_ENV_FILE"
+  set +a
+fi
+
+export PATH="$INSTALL_ROOT/bin:$INSTALL_ROOT/formula-tools/bin:$PATH"
+export PYTHONPATH="$INSTALL_ROOT/runtime/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+export PAPER_FETCH_DOWNLOAD_DIR="${PAPER_FETCH_DOWNLOAD_DIR:-$INSTALL_ROOT/downloads}"
+export PAPER_FETCH_FORMULA_TOOLS_DIR="${PAPER_FETCH_FORMULA_TOOLS_DIR:-$INSTALL_ROOT/formula-tools}"
+export CLOAKBROWSER_HEADLESS="${CLOAKBROWSER_HEADLESS:-__CLOAKBROWSER_HEADLESS__}"
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+EOF
+    target_tmp="$(mktemp)"
+    awk -v headless="$(cloakbrowser_headless_value)" '{ gsub(/__CLOAKBROWSER_HEADLESS__/, headless); print }' "$target" > "$target_tmp"
+    mv "$target_tmp" "$target"
+  fi
+  chmod +x "$target"
+}
+
+check_cloakbrowser_package() {
+  local runtime_python
+  runtime_python="$(mcp_python_bin)"
+  "$runtime_python" -c 'import cloakbrowser; assert hasattr(cloakbrowser, "launch")'
+  if [ -n "${CLOAKBROWSER_BINARY_PATH:-}" ] && [ ! -x "$CLOAKBROWSER_BINARY_PATH" ]; then
+    die "CLOAKBROWSER_BINARY_PATH is set but is not executable: $CLOAKBROWSER_BINARY_PATH"
+  fi
+}
+
+warm_cloakbrowser_runtime() {
+  local runtime_python
+  runtime_python="$(mcp_python_bin)"
+  if [ -n "${CLOAKBROWSER_BINARY_PATH:-}" ]; then
+    log "Using preconfigured CLOAKBROWSER_BINARY_PATH; skipping CloakBrowser runtime download"
+    [ -x "$CLOAKBROWSER_BINARY_PATH" ] || die "CLOAKBROWSER_BINARY_PATH is set but is not executable: $CLOAKBROWSER_BINARY_PATH"
+    return 0
+  fi
+  log "Checking CloakBrowser package availability"
+  "$runtime_python" -c 'import cloakbrowser; assert hasattr(cloakbrowser, "launch")' \
+    || warn "CloakBrowser package check failed; set CLOAKBROWSER_BINARY_PATH to a preinstalled binary before browser-backed fetches if needed."
+}
+
+run_smoke_checks() {
+  [ "$RUN_SMOKE" = "1" ] || return 0
+
+  local key env_args=()
+
+  log "Running local smoke checks"
+  "$INSTALL_ROOT/bin/paper-fetch" --help >/dev/null
+  "$INSTALL_ROOT/formula-tools/bin/texmath" --help >/dev/null
+  check_cloakbrowser_package
+  for key in "${MCP_ENV_KEYS[@]}"; do
+    env_args+=("$key=$(mcp_env_value "$key")")
+  done
+  env "${env_args[@]}" "$(mcp_python_bin)" -c 'from paper_fetch.mcp.fetch_tool import provider_status_payload; payload = provider_status_payload(); assert "providers" in payload'
+}
+
+same_directory() {
+  local left="$1"
+  local right="$2"
+  [ -d "$left" ] || return 1
+  [ -d "$right" ] || return 1
+  [ "$(cd "$left" && pwd -P)" = "$(cd "$right" && pwd -P)" ]
+}
+
+clean_install_root_payload() {
+  mkdir -p "$INSTALL_ROOT"
+  rm -rf \
+    "$INSTALL_ROOT/bin" \
+    "$INSTALL_ROOT/runtime" \
+    "$INSTALL_ROOT/formula-tools" \
+    "$INSTALL_ROOT/skills" \
+    "$INSTALL_ROOT/installer" \
+    "$INSTALL_ROOT/install-offline.sh" \
+    "$INSTALL_ROOT/activate-offline.sh" \
+    "$INSTALL_ROOT/README.offline.md" \
+    "$INSTALL_ROOT/offline-manifest.json" \
+    "$INSTALL_ROOT/sha256sums.txt" \
+    "$INSTALL_ROOT/LICENSE" \
+    "$INSTALL_ROOT/.env.example" \
+    "$INSTALL_ROOT/src" \
+    "$INSTALL_ROOT/tests" \
+    "$INSTALL_ROOT/.github" \
+    "$INSTALL_ROOT/wheelhouse" \
+    "$INSTALL_ROOT/dist" \
+    "$INSTALL_ROOT/pyproject.toml"
+}
+
+install_runtime_payload() {
+  local env_backup=""
+
+  mkdir -p "$INSTALL_ROOT"
+  if same_directory "$BUNDLE_ROOT" "$INSTALL_ROOT"; then
+    log "Using existing offline runtime directory: $INSTALL_ROOT"
+    return 0
+  fi
+
+  if [ "$REUSE_ENV_FILE" != "1" ] && [ -f "$INSTALL_ROOT/offline.env" ]; then
+    env_backup="$(mktemp)"
+    cp "$INSTALL_ROOT/offline.env" "$env_backup"
+  fi
+
+  log "Installing runtime payload to $INSTALL_ROOT"
+  clean_install_root_payload
+  cp -a "$BUNDLE_ROOT/." "$INSTALL_ROOT/"
+
+  if [ -n "$env_backup" ]; then
+    cp "$env_backup" "$INSTALL_ROOT/offline.env"
+    rm -f "$env_backup"
+  fi
+}
+
+main() {
+  load_installer_manifest
+
+  if [ "$UNINSTALL" = "1" ]; then
+    uninstall_user_integrations
+    if [ "$PURGE" = "1" ]; then
+      purge_install_root
+    fi
+    return 0
+  fi
+
+  check_platform
+  check_python
+  verify_checksums
+  check_preset_requirements
+  check_bundle_assets
+  install_runtime_payload
+  write_runtime_python_file
+
+  warm_cloakbrowser_runtime
+
+  if [ "$REUSE_ENV_FILE" = "1" ]; then
+    log "Reusing offline.env without modifying it: $OFFLINE_ENV_FILE"
+  else
+    log "Writing install offline.env"
+    write_managed_env_file "$OFFLINE_ENV_FILE"
+  fi
+  write_activate_script
+
+  if [ "$MERGE_USER_CONFIG" = "1" ]; then
+    [ -n "${HOME:-}" ] || die "HOME is required for --user-config."
+    log "Merging offline runtime block into $HOME/.config/paper-fetch/.env"
+    write_managed_env_file "$HOME/.config/paper-fetch/.env"
+  fi
+
+  install_skills
+  write_shell_startup_file
+  register_codex_mcp
+  register_claude_mcp
+
+  run_smoke_checks
+
+  echo
+  echo "Offline installation complete."
+  echo "Shell startup file updated: $SHELL_STARTUP_TARGET"
+  echo "Install directory: $INSTALL_ROOT"
+  echo "Open a new shell, or activate the current one with: source $INSTALL_ROOT/activate-offline.sh"
+  echo "CloakBrowser headless: $(cloakbrowser_headless_value)"
+  echo "Optional runtime override: set CLOAKBROWSER_BINARY_PATH in $OFFLINE_ENV_FILE before first browser fetch."
+  echo "Restart Codex and Claude Code so they rescan skills and MCP registration."
+  echo "Elsevier setup: request a key at https://dev.elsevier.com/, then add ELSEVIER_API_KEY=\"...\" to $OFFLINE_ENV_FILE before fetching Elsevier papers."
+}
+
+main "$@"

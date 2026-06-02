@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+projects/
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.env
+.env.*
+!.env.example
+
+# Local paper/full-text artifacts
+references/fulltext/
+*.pdf
+*.aux
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Keep the vendored paper-fetch runtime lean in this repository.
+third_party/paper-fetch-skill/.git/
+third_party/paper-fetch-skill/.github/
+third_party/paper-fetch-skill/tests/
+third_party/paper-fetch-skill/figures/
+third_party/paper-fetch-skill/onboarding/
+third_party/paper-fetch-skill/docs/architecture/

@@ -1,0 +1,18 @@
+[project]
+name = "draftpaper-cli"
+version = "0.1.0"
+description = "Local-first staged CLI workflow for research paper projects."
+readme = "docs/cli_workflow_priority_guide.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "xiejhhhhhh" }
+]
+keywords = ["research", "latex", "paper-writing", "cli", "codex-skills"]
+
+[project.scripts]
+draftpaper = "draftpaper_cli.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+

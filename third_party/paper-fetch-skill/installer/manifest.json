@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "project": "paper-fetch-skill",
+  "skill": {
+    "name": "paper-fetch-skill",
+    "display_name": "Paper Fetch Skill",
+    "short_description": "Fetch AI-friendly paper text by DOI, URL, or title",
+    "default_prompt": "Use $paper-fetch-skill whenever you need the text, readability, or full-text availability of a specific paper or a citation list of identifiable papers."
+  },
+  "mcp": {
+    "name": "paper-fetch",
+    "env_keys": [
+      "PYTHONUTF8",
+      "PYTHONIOENCODING",
+      "PAPER_FETCH_ENV_FILE",
+      "PAPER_FETCH_DOWNLOAD_DIR",
+      "PAPER_FETCH_FORMULA_TOOLS_DIR",
+      "MATHML_TO_LATEX_NODE_BIN",
+      "CLOAKBROWSER_HEADLESS"
+    ]
+  },
+  "managed_blocks": {
+    "offline": {
+      "begin": "# BEGIN paper-fetch offline managed",
+      "end": "# END paper-fetch offline managed"
+    },
+    "codex": {
+      "begin": "# BEGIN paper-fetch installer managed",
+      "end": "# END paper-fetch installer managed"
+    }
+  },
+  "packages": {
+    "linux_offline_name_prefix": "paper-fetch-skill-offline-linux-x86_64",
+    "linux_manifest_name": "paper-fetch-skill-offline",
+    "macos_offline_name_prefix": "paper-fetch-skill-offline-macos",
+    "macos_manifest_name": "paper-fetch-skill-offline",
+    "windows_setup_base_name": "paper-fetch-skill-windows-x86_64-setup",
+    "windows_manifest_name": "paper-fetch-skill-windows-setup"
+  }
+}
