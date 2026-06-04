@@ -12,7 +12,10 @@ keywords = ["research", "latex", "paper-writing", "cli", "codex-skills"]
 [project.scripts]
 draftpaper = "draftpaper_cli.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["draftpaper_cli*"]
+exclude = ["codex_skills*", "github_submit*", "third_party*", "tests*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-
