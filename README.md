@@ -70,6 +70,8 @@ For staged work, Codex should first call the orchestrator layer:
 ```powershell
 python -m draftpaper_cli.cli status --project C:\DraftPaper_CLI\projects\your_project
 python -m draftpaper_cli.cli run-pipeline --project C:\DraftPaper_CLI\projects\your_project
+python -m draftpaper_cli.cli detect-artifact-drift --project C:\DraftPaper_CLI\projects\your_project
+python -m draftpaper_cli.cli sync-artifact-stale --project C:\DraftPaper_CLI\projects\your_project
 ```
 
 ### One-Command Local Setup
@@ -123,9 +125,11 @@ python -m unittest discover -s tests
 
 ## Implementation Status
 
-The CLI already includes an orchestrator layer (`status`, `checkpoint`, `resume`, `run-pipeline`) plus staged commands for project state, literature search, journal profile resolution, research plan generation, Introduction, data inventory and feasibility checks, method-plan collection, literature-informed baseline analysis-code generation, method execution verification, Methods writing, result validity checks, result inventory, Results writing, Discussion, LaTeX assembly, PDF compilation, and final quality checks.
+The CLI already includes an orchestrator layer (`status`, `checkpoint`, `resume`, `run-pipeline`) plus hash-based stale synchronization (`detect-artifact-drift`, `sync-artifact-stale`) and staged commands for project state, literature search, journal profile resolution, research plan generation, Introduction, data inventory and feasibility checks, method-plan collection, literature-informed baseline analysis-code generation, method execution verification, Methods writing, result validity checks, result inventory, Results writing, Discussion, LaTeX assembly, PDF compilation, and final quality checks.
 
 Every project now carries a DraftPaper Passport at `project_passport.yaml` plus append-only `artifact_ledger.jsonl`, `checkpoint_ledger.jsonl`, and `integrity_ledger.jsonl`. These files record project artifacts, hashes, explicit user checkpoints, and integrity events so the project can be moved across machines and later audited without relying on Codex conversation memory.
+
+When a tracked artifact hash changes, `status` reports `pipeline_state=drift_detected` and recommends `sync-artifact-stale`. That command maps changed artifact paths back to their source stages, marks downstream dependent stages stale, records the drift in `integrity_ledger.jsonl`, and refreshes the passport hash baseline.
 
 `generate-analysis-code` reads retrieved literature, `methods/method_requirements.json`, `methods/method_plan.md`, and `data/data_inventory.json`, then writes reviewable project-local Python code under `code/` plus `methods/analysis_code_manifest.json`. The generated baseline now produces two tables and four required SVG figures by default: data analysis workflow, data processing workflow, method analysis workflow, and data-to-method output workflow. It is intentionally a reproducible scaffold rather than a final scientific model; `verify-methods` must still run the generated command, record `methods/run_manifest.yaml`, and block Methods writing until every declared output exists. `inventory-results` then converts the verified figures and tables into `results/result_manifest.yaml`, and `write-results` writes citation-free result paragraphs from that manifest.
 

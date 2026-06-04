@@ -66,6 +66,8 @@ Codex 应该负责运行对应 CLI 命令、读取生成的本地项目文件，
 ```powershell
 python -m draftpaper_cli.cli status --project C:\DraftPaper_CLI\projects\your_project
 python -m draftpaper_cli.cli run-pipeline --project C:\DraftPaper_CLI\projects\your_project
+python -m draftpaper_cli.cli detect-artifact-drift --project C:\DraftPaper_CLI\projects\your_project
+python -m draftpaper_cli.cli sync-artifact-stale --project C:\DraftPaper_CLI\projects\your_project
 ```
 
 ### 一键本地安装
@@ -119,9 +121,11 @@ python -m unittest discover -s tests
 
 ## 当前实现状态
 
-CLI 已经实装总控层命令（`status`、`checkpoint`、`resume`、`run-pipeline`），以及项目状态、文献检索、目标期刊 profile、research plan、Introduction、数据清单和可行性检查、method plan 收集、基于文献和 methods 描述的 baseline 分析代码生成、方法代码运行验证、Methods 撰写、结果有效性检查、结果清单、Results 撰写、Discussion、LaTeX 组装、PDF 编译和最终质量检查等阶段命令。
+CLI 已经实装总控层命令（`status`、`checkpoint`、`resume`、`run-pipeline`）、基于 hash 的 stale 同步命令（`detect-artifact-drift`、`sync-artifact-stale`），以及项目状态、文献检索、目标期刊 profile、research plan、Introduction、数据清单和可行性检查、method plan 收集、基于文献和 methods 描述的 baseline 分析代码生成、方法代码运行验证、Methods 撰写、结果有效性检查、结果清单、Results 撰写、Discussion、LaTeX 组装、PDF 编译和最终质量检查等阶段命令。
 
 每个项目现在都会带有 DraftPaper Passport：`project_passport.yaml`，以及 append-only 的 `artifact_ledger.jsonl`、`checkpoint_ledger.jsonl`、`integrity_ledger.jsonl`。这些文件记录项目 artifact、hash、人工 checkpoint 和 integrity event，方便换电脑迁移，也避免依赖 Codex 对话记忆来判断项目状态。
+
+当被追踪 artifact 的 hash 发生变化时，`status` 会返回 `pipeline_state=drift_detected`，并建议先运行 `sync-artifact-stale`。该命令会把变化文件映射回来源阶段，自动把下游依赖阶段标记为 stale，把 drift 记录写入 `integrity_ledger.jsonl`，并刷新 passport 的 hash 基线。
 
 `generate-analysis-code` 会读取已检索文献、`methods/method_requirements.json`、`methods/method_plan.md` 和 `data/data_inventory.json`，在项目 `code/` 目录下生成可审阅、可运行的 Python baseline 分析代码，并写入 `methods/analysis_code_manifest.json`。默认输出已经扩展为两张表和四张 SVG 图：数据分析流程、数据处理流程、方法分析流程、数据喂入方法后的输出流程。该阶段不是跳过科研审查的最终模型生成器，而是可复现的代码脚手架；后续仍必须用 `verify-methods` 运行生成命令、记录 `methods/run_manifest.yaml`，并确认所有声明输出都存在后才能继续写 Methods。`inventory-results` 会把通过验证的图表转成 `results/result_manifest.yaml`，`write-results` 再根据该 manifest 写出不含文献引用的结果段落。
 

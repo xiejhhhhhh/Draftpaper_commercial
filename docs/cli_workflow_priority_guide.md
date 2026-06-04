@@ -41,6 +41,19 @@ integrity_ledger.jsonl
 
 This foundation is the portable state layer for Codex skills, Web UI, desktop UI, and future API/SaaS wrappers. Wrapper layers should call `status` or `run-pipeline` first, then call the stage command suggested by the orchestrator.
 
+## Priority C: Hash-Based Stale and Backtracking
+
+The workflow should not rely only on manually maintained `stale` flags. DraftPaper now compares current artifact hashes against the last `project_passport.yaml` snapshot before planning the next stage.
+
+Implemented Priority C CLI commands:
+
+```powershell
+python -m draftpaper_cli.cli detect-artifact-drift --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli sync-artifact-stale --project C:\DraftPaper_CLI\projects\my_project
+```
+
+`detect-artifact-drift` is read-only. It reports changed, missing, or newly tracked artifacts and maps each path back to a source stage. `sync-artifact-stale` is mutating. It marks downstream dependent stages stale, appends an `artifact_drift` event to `integrity_ledger.jsonl`, and refreshes the passport hash baseline. `status` and `run-pipeline` surface `pipeline_state=drift_detected` before continuing, so Codex/Web/Desktop wrappers should run `sync-artifact-stale` first whenever drift is reported.
+
 ## Priority 1: Single-Paper Project Directory Model
 
 Each research idea becomes an independent project directory:
@@ -637,6 +650,8 @@ quality_checks
 python -m draftpaper_cli.cli create-project --root C:\DraftPaper_CLI\projects --idea "..." --field "..."
 python -m draftpaper_cli.cli status --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli run-pipeline --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli detect-artifact-drift --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli sync-artifact-stale --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli search-literature --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli resolve-journal-template --project C:\DraftPaper_CLI\projects\my_project --target-journal APJS
 python -m draftpaper_cli.cli generate-plan --project C:\DraftPaper_CLI\projects\my_project

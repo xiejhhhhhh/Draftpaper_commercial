@@ -30,6 +30,7 @@ from .quality_gate import QualityGateError, run_quality_check
 from .research_plan import MissingReferencesError, NoveltyOverlapError, generate_research_plan
 from .result_validity import ResultValidityError, assess_result_validity
 from .results import ResultsGateError, inventory_results, write_results
+from .stale_sync import ArtifactDriftError, detect_artifact_drift, sync_artifact_stale
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run-pipeline", help="Plan the next orchestrated pipeline action.")
     run.add_argument("--project", required=True, help="Path to a project directory or project.json.")
+
+    drift = subparsers.add_parser("detect-artifact-drift", help="Detect artifact hash drift from project_passport.yaml.")
+    drift.add_argument("--project", required=True, help="Path to a project directory or project.json.")
+
+    sync_stale = subparsers.add_parser("sync-artifact-stale", help="Mark dependent stages stale from artifact hash drift.")
+    sync_stale.add_argument("--project", required=True, help="Path to a project directory or project.json.")
 
     update = subparsers.add_parser("update-stage-status", help="Update one stage status.")
     update.add_argument("--project", required=True, help="Path to a project directory or project.json.")
@@ -237,7 +244,25 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
             return 1
         print(json.dumps(result, ensure_ascii=False))
-        return 0 if result.get("status") in {"planned", "awaiting_confirmation"} else 1
+        return 0 if result.get("status") in {"planned", "awaiting_confirmation", "drift_detected"} else 1
+
+    if args.command == "detect-artifact-drift":
+        try:
+            result = detect_artifact_drift(args.project)
+        except (ArtifactDriftError, PassportError, ProjectStateError) as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "sync-artifact-stale":
+        try:
+            result = sync_artifact_stale(args.project)
+        except (ArtifactDriftError, PassportError, ProjectStateError) as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
 
     if args.command == "update-stage-status":
         try:

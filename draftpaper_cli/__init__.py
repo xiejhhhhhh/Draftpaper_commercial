@@ -23,6 +23,7 @@ from .quality_gate import QualityGateError, run_quality_check
 from .references import write_reference_outputs
 from .research_plan import MissingReferencesError, generate_research_plan
 from .results import ResultsGateError, inventory_results, write_results
+from .stale_sync import ArtifactDriftError, detect_artifact_drift, sync_artifact_stale
 
 __all__ = [
     "InvalidStageStatusError",
@@ -32,6 +33,7 @@ __all__ = [
     "DiscussionCitationIntegrityError",
     "DataGateError",
     "AnalysisCodeGenerationError",
+    "ArtifactDriftError",
     "LatexAssemblyError",
     "LatexCitationError",
     "MethodsGateError",
@@ -56,6 +58,8 @@ __all__ = [
     "run_pipeline",
     "load_project_passport",
     "refresh_project_passport",
+    "detect_artifact_drift",
+    "sync_artifact_stale",
     "generate_analysis_code",
     "write_introduction",
     "inventory_data",

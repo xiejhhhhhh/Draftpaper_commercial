@@ -17,6 +17,7 @@ from .passport import (
 )
 from .project_scaffold import STAGE_ORDER
 from .project_state import ProjectStateError, load_project
+from .stale_sync import detect_artifact_drift
 
 
 COMPLETE_STATUSES = {"draft", "approved", "completed"}
@@ -89,6 +90,23 @@ def _next_action(project_path: Path, metadata: dict[str, Any]) -> dict[str, Any]
 def status_project(project: str | Path) -> dict[str, Any]:
     """Return pipeline status, passport state, and the next CLI action."""
     state = load_project(project)
+    drift = detect_artifact_drift(state.path)
+    if drift.get("status") == "drift_detected":
+        return {
+            "status": "reported",
+            "project_path": str(state.path),
+            "pipeline_state": "drift_detected",
+            "current_stage": state.metadata.get("current_stage"),
+            "awaiting_checkpoint": None,
+            "passport": str(state.path / PASSPORT_FILES["passport"]),
+            "drift": drift,
+            "next_action": {
+                "stage": None,
+                "command": "sync-artifact-stale",
+                "cli": f"python -m draftpaper_cli.cli sync-artifact-stale --project {_quote(state.path)}",
+                "reason": "Artifact hashes changed since the last passport snapshot.",
+            },
+        }
     passport = refresh_project_passport(state.path, event="status")
     awaiting = passport.get("awaiting_checkpoint")
     if awaiting:
@@ -186,6 +204,13 @@ def run_pipeline(project: str | Path) -> dict[str, Any]:
             "status": "awaiting_confirmation",
             "project_path": status["project_path"],
             "awaiting_checkpoint": status["awaiting_checkpoint"],
+            "next_action": status["next_action"],
+        }
+    if status["pipeline_state"] == "drift_detected":
+        return {
+            "status": "drift_detected",
+            "project_path": status["project_path"],
+            "drift": status["drift"],
             "next_action": status["next_action"],
         }
     return {

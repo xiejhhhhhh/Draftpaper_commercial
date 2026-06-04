@@ -10,13 +10,15 @@ python -m draftpaper_cli.cli load-project --project C:\DraftPaper_CLI\projects\m
 python -m draftpaper_cli.cli validate-project --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli status --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli run-pipeline --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli detect-artifact-drift --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli sync-artifact-stale --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli checkpoint --project C:\DraftPaper_CLI\projects\my_project --stage research_plan --note "User approved the research plan"
 python -m draftpaper_cli.cli resume --project C:\DraftPaper_CLI\projects\my_project --checkpoint-hash abc123def456
 python -m draftpaper_cli.cli mark-stage-stale --project C:\DraftPaper_CLI\projects\my_project --stage references
 python -m draftpaper_cli.cli update-stage-status --project C:\DraftPaper_CLI\projects\my_project --stage data --status draft
 ```
 
-`status` and `run-pipeline` are the orchestrator layer. They inspect `project.json`, stage manifests, `project_passport.yaml`, and append-only ledgers to report the next safe action. `checkpoint` records an explicit human confirmation boundary in `checkpoint_ledger.jsonl`; `resume` consumes it by appending a resume event, never by deleting or rewriting the checkpoint.
+`status` and `run-pipeline` are the orchestrator layer. They inspect `project.json`, stage manifests, `project_passport.yaml`, and append-only ledgers to report the next safe action. If `status` returns `pipeline_state=drift_detected`, run `sync-artifact-stale` before any downstream stage. `detect-artifact-drift` is read-only; `sync-artifact-stale` maps hash drift to downstream stale stages, writes an integrity ledger event, and refreshes the passport baseline. `checkpoint` records an explicit human confirmation boundary in `checkpoint_ledger.jsonl`; `resume` consumes it by appending a resume event, never by deleting or rewriting the checkpoint.
 
 ## Literature and Plan
 

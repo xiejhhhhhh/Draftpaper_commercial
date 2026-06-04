@@ -27,6 +27,8 @@ python -m draftpaper_cli.cli status --project <project>
 
 Use `run-pipeline` to ask the orchestrator for the next safe CLI action. Use `checkpoint` whenever a stage requires explicit human confirmation; if `status` reports `pipeline_state=awaiting_confirmation`, do not continue into downstream stages until the user confirms and `resume` consumes the checkpoint hash.
 
+If `status` reports `pipeline_state=drift_detected`, run `sync-artifact-stale` before continuing. This maps changed artifact hashes to downstream stale stages and refreshes the passport baseline. Do not manually decide stale stages when the CLI can compute them from the artifact ledger.
+
 ## Stage Order
 
 Run stages in this order unless the user asks for a focused rerun:
