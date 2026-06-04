@@ -55,6 +55,31 @@ Generated paper projects are stored under `projects/` locally and are intentiona
 
 ## Quick Start
 
+### One-Command Setup
+
+Run this from the directory where you want to place the repository. The command clones the private repository, creates a local virtual environment, installs DraftPaper CLI plus the vendored paper-fetch runtime, and prints the CLI help.
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "git clone https://github.com/xiejhhhhhh/Draftpaper_commercial.git; cd Draftpaper_commercial; py -3 -m venv .venv; .\.venv\Scripts\python -m pip install -U pip; .\.venv\Scripts\python -m pip install -e . -e third_party\paper-fetch-skill; .\.venv\Scripts\draftpaper --help"
+```
+
+After setup, use the installed `draftpaper` command from the repository root:
+
+```powershell
+.\.venv\Scripts\draftpaper create-project --root .\projects --idea "Your research idea" --field "machine learning astronomy" --target-journal APJS
+.\.venv\Scripts\draftpaper search-literature --project .\projects\your_project --query "topic keywords"
+.\.venv\Scripts\draftpaper validate-project --project .\projects\your_project
+```
+
+For a quick local smoke test without live literature search, create and validate a project:
+
+```powershell
+.\.venv\Scripts\draftpaper create-project --root .\projects --idea "X-ray flaring source classification" --field "machine learning astronomy" --target-journal APJS
+.\.venv\Scripts\draftpaper validate-project --project .\projects\x-ray-flaring-source-classification
+```
+
+### Editable Install
+
 ```powershell
 python -m pip install -e .
 python -m draftpaper_cli.cli create-project --root C:\DraftPaper_CLI\projects --idea "Your research idea" --field "machine learning astronomy" --target-journal APJS

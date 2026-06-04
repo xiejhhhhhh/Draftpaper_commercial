@@ -51,6 +51,31 @@ github_submit/                  # GitHub 提交材料和说明
 
 ## 快速开始
 
+### 一键安装和启动
+
+在你希望保存项目的目录中运行下面这条命令。它会克隆私有仓库，创建本地虚拟环境，安装 DraftPaper CLI 和项目内置的 paper-fetch runtime，并打印 CLI 帮助信息。
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "git clone https://github.com/xiejhhhhhh/Draftpaper_commercial.git; cd Draftpaper_commercial; py -3 -m venv .venv; .\.venv\Scripts\python -m pip install -U pip; .\.venv\Scripts\python -m pip install -e . -e third_party\paper-fetch-skill; .\.venv\Scripts\draftpaper --help"
+```
+
+安装后，在仓库根目录中直接使用 `draftpaper` 命令：
+
+```powershell
+.\.venv\Scripts\draftpaper create-project --root .\projects --idea "你的研究idea" --field "machine learning astronomy" --target-journal APJS
+.\.venv\Scripts\draftpaper search-literature --project .\projects\your_project --query "topic keywords"
+.\.venv\Scripts\draftpaper validate-project --project .\projects\your_project
+```
+
+如果只想快速确认 CLI 能运行，不进行联网文献检索，可以执行：
+
+```powershell
+.\.venv\Scripts\draftpaper create-project --root .\projects --idea "X-ray flaring source classification" --field "machine learning astronomy" --target-journal APJS
+.\.venv\Scripts\draftpaper validate-project --project .\projects\x-ray-flaring-source-classification
+```
+
+### 开发模式安装
+
 ```powershell
 python -m pip install -e .
 python -m draftpaper_cli.cli create-project --root C:\DraftPaper_CLI\projects --idea "你的研究idea" --field "machine learning astronomy" --target-journal APJS
