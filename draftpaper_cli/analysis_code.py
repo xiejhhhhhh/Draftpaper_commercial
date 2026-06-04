@@ -8,7 +8,7 @@ from typing import Any
 
 from .method_plan import MethodPlanError, validate_method_plan_for_methods
 from .project_scaffold import _write_json, utc_now
-from .project_state import load_project
+from .project_state import load_project, update_stage_status
 
 
 ANALYSIS_CODE_INPUTS = [
@@ -28,6 +28,10 @@ ANALYSIS_CODE_OUTPUTS = [
 DEFAULT_DECLARED_OUTPUTS = [
     "results/tables/metrics.csv",
     "results/tables/analysis_summary.csv",
+    "results/figures/data_analysis_flow.svg",
+    "results/figures/data_processing_flow.svg",
+    "results/figures/method_analysis_flow.svg",
+    "results/figures/data_to_method_outputs.svg",
 ]
 
 TABULAR_SUFFIXES = {".csv", ".tsv"}
@@ -111,6 +115,7 @@ def _render_generated_pipeline(manifest: dict[str, Any]) -> str:
 
 import csv
 import json
+from html import escape
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -169,6 +174,34 @@ def compute_baseline_metrics(rows: list[dict[str, str]], label_column: str | Non
     return metrics
 
 
+def write_flow_svg(path: Path, title: str, steps: list[str], accent: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    width = 1120
+    height = 210
+    box_width = 210
+    box_height = 72
+    gap = 48
+    start_x = 38
+    box_y = 88
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{{width}}" height="{{height}}" viewBox="0 0 {{width}} {{height}}">',
+        '<rect width="1120" height="210" fill="#ffffff"/>',
+        f'<text x="38" y="42" font-family="Arial, sans-serif" font-size="24" fill="#1f2937">{{escape(title)}}</text>',
+    ]
+    for index, step in enumerate(steps):
+        x = start_x + index * (box_width + gap)
+        parts.append(f'<rect x="{{x}}" y="{{box_y}}" width="{{box_width}}" height="{{box_height}}" rx="6" fill="#f8fafc" stroke="{{accent}}" stroke-width="2"/>')
+        parts.append(f'<text x="{{x + 18}}" y="{{box_y + 32}}" font-family="Arial, sans-serif" font-size="15" fill="#111827">{{escape(step[:32])}}</text>')
+        if len(step) > 32:
+            parts.append(f'<text x="{{x + 18}}" y="{{box_y + 54}}" font-family="Arial, sans-serif" font-size="13" fill="#4b5563">{{escape(step[32:64])}}</text>')
+        if index < len(steps) - 1:
+            arrow_x = x + box_width + 10
+            parts.append(f'<line x1="{{arrow_x}}" y1="{{box_y + 36}}" x2="{{arrow_x + gap - 20}}" y2="{{box_y + 36}}" stroke="#6b7280" stroke-width="2"/>')
+            parts.append(f'<polygon points="{{arrow_x + gap - 20}},{{box_y + 36}} {{arrow_x + gap - 30}},{{box_y + 29}} {{arrow_x + gap - 30}},{{box_y + 43}}" fill="#6b7280"/>')
+    parts.append("</svg>")
+    path.write_text("\\n".join(parts), encoding="utf-8")
+
+
 def run_pipeline(project_root: Path | None = None) -> dict[str, Any]:
     root = project_root or Path(__file__).resolve().parents[2]
     input_path = root / PIPELINE_MANIFEST["selected_input_data"]
@@ -189,7 +222,43 @@ def run_pipeline(project_root: Path | None = None) -> dict[str, Any]:
         ],
         ("key", "value"),
     )
-    return {{"metrics": metrics, "outputs": [str(metrics_path), str(summary_path)]}}
+    figures_dir = root / "results" / "figures"
+    families = PIPELINE_MANIFEST.get("method_families") or ["model workflow"]
+    write_flow_svg(
+        figures_dir / "data_analysis_flow.svg",
+        "Data analysis workflow",
+        ["Local data inventory", "Quality and feasibility gate", "Feature table profiling", "Metric-ready outputs"],
+        "#2563eb",
+    )
+    write_flow_svg(
+        figures_dir / "data_processing_flow.svg",
+        "Data processing workflow",
+        ["Read tabular source data", "Infer label column", "Summarize feature space", "Write analysis tables"],
+        "#059669",
+    )
+    write_flow_svg(
+        figures_dir / "method_analysis_flow.svg",
+        "Method analysis workflow",
+        ["Literature method synthesis", families[0].replace("_", " "), "Baseline metric check", "Run manifest gate"],
+        "#7c3aed",
+    )
+    write_flow_svg(
+        figures_dir / "data_to_method_outputs.svg",
+        "Data-to-method output workflow",
+        ["Selected input data", "Generated pipeline", "Metrics and summaries", "Result figures"],
+        "#dc2626",
+    )
+    return {{
+        "metrics": metrics,
+        "outputs": [
+            str(metrics_path),
+            str(summary_path),
+            str(figures_dir / "data_analysis_flow.svg"),
+            str(figures_dir / "data_processing_flow.svg"),
+            str(figures_dir / "method_analysis_flow.svg"),
+            str(figures_dir / "data_to_method_outputs.svg"),
+        ],
+    }}
 '''
 
 
@@ -244,6 +313,14 @@ def test_compute_baseline_metrics_from_labels() -> None:
 
 def _set_analysis_manifest(project_path: Path, payload: dict[str, Any]) -> None:
     _write_json(project_path / "methods" / "analysis_code_manifest.json", payload)
+
+
+def _set_code_stage_manifest(project_path: Path) -> None:
+    manifest_path = project_path / "code" / "stage_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["input_files"] = ANALYSIS_CODE_INPUTS
+    manifest["output_files"] = ANALYSIS_CODE_OUTPUTS
+    _write_json(manifest_path, manifest)
 
 
 def generate_analysis_code(
@@ -305,6 +382,8 @@ def generate_analysis_code(
     (scripts_dir / "run_analysis.py").write_text(_render_run_script(), encoding="utf-8")
     (tests_dir / "test_generated_pipeline.py").write_text(_render_generated_test(), encoding="utf-8")
     _set_analysis_manifest(state.path, manifest)
+    _set_code_stage_manifest(state.path)
+    update_stage_status(state.path, "code", "draft")
 
     verify_command = f"{_quote_command(sys.executable)} code/scripts/run_analysis.py"
     return {

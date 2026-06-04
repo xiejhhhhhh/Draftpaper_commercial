@@ -67,6 +67,7 @@ def prepare_codegen_project(project_path: Path) -> None:
 class AnalysisCodeGenerationTests(unittest.TestCase):
     def test_generate_analysis_code_writes_manifest_and_runnable_code(self) -> None:
         from draftpaper_cli.analysis_code import generate_analysis_code
+        from draftpaper_cli.project_state import load_project
 
         with tempfile.TemporaryDirectory() as tmp:
             project = create_project(root=tmp, idea="X-ray flaring source classification", field="astronomy machine learning")
@@ -80,8 +81,18 @@ class AnalysisCodeGenerationTests(unittest.TestCase):
             self.assertTrue((project.path / "code" / "tests" / "test_generated_pipeline.py").exists())
             self.assertEqual(
                 result["declared_outputs"],
-                ["results/tables/metrics.csv", "results/tables/analysis_summary.csv"],
+                [
+                    "results/tables/metrics.csv",
+                    "results/tables/analysis_summary.csv",
+                    "results/figures/data_analysis_flow.svg",
+                    "results/figures/data_processing_flow.svg",
+                    "results/figures/method_analysis_flow.svg",
+                    "results/figures/data_to_method_outputs.svg",
+                ],
             )
+            state = load_project(project.path)
+            self.assertEqual(state.metadata["stages"]["code"]["status"], "draft")
+            self.assertTrue(state.metadata["stages"]["methods"]["stale"])
 
             manifest = json.loads((project.path / "methods" / "analysis_code_manifest.json").read_text(encoding="utf-8"))
             self.assertIn("time_series_deep_learning", manifest["method_families"])
@@ -99,6 +110,10 @@ class AnalysisCodeGenerationTests(unittest.TestCase):
             metrics = json.loads((project.path / "methods" / "run_manifest.yaml").read_text(encoding="utf-8"))["metrics"]
             self.assertIn("f1", metrics)
             self.assertIn("row_count", metrics)
+            self.assertTrue((project.path / "results" / "figures" / "data_analysis_flow.svg").exists())
+            self.assertTrue((project.path / "results" / "figures" / "data_processing_flow.svg").exists())
+            self.assertTrue((project.path / "results" / "figures" / "method_analysis_flow.svg").exists())
+            self.assertTrue((project.path / "results" / "figures" / "data_to_method_outputs.svg").exists())
 
     def test_cli_generate_analysis_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

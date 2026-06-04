@@ -57,23 +57,71 @@ def _artifact_id(prefix: str, index: int, path: Path) -> str:
     return f"{prefix}_{index}_{stem}"
 
 
-def _figure_entry(project_path: Path, path: Path, index: int) -> dict[str, str]:
-    relative = path.relative_to(project_path).as_posix()
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _artifact_context(project_path: Path) -> dict[str, dict[str, str]]:
+    analysis_manifest = _read_json(project_path / "methods" / "analysis_code_manifest.json")
+    run_manifest = _read_json(project_path / "methods" / "run_manifest.yaml")
+    selected_input = analysis_manifest.get("selected_input_data") or "the selected local data"
+    method_families = ", ".join(str(item).replace("_", " ") for item in (analysis_manifest.get("method_families") or []))
+    primary_metric = analysis_manifest.get("primary_metric") or "primary metric"
+    observed = (run_manifest.get("metrics") or {}).get(str(primary_metric))
+    metric_text = f"{primary_metric}={observed}" if observed is not None else str(primary_metric)
     return {
-        "id": _artifact_id("fig", index, path),
-        "path": relative,
-        "caption_draft": f"Result figure {index}: {path.stem.replace('_', ' ')}.",
-        "result_claim": f"The artifact {relative} provides visual evidence for one result that should be interpreted directly from the generated output.",
+        "data_analysis_flow.svg": {
+            "caption": "Data analysis workflow from local inventory to metric-ready artifacts.",
+            "claim": f"The data analysis workflow starts from {selected_input}, passes through quality and feasibility checks, and produces local artifacts for result assessment.",
+        },
+        "data_processing_flow.svg": {
+            "caption": "Data processing workflow used by the generated method pipeline.",
+            "claim": "The processing workflow shows how the selected tabular input is read, profiled, mapped to a label column, and converted into reproducible summary outputs.",
+        },
+        "method_analysis_flow.svg": {
+            "caption": "Method analysis workflow derived from the literature-informed method plan.",
+            "claim": f"The method analysis workflow links literature-derived method families ({method_families or 'method family pending confirmation'}) to a verified local run.",
+        },
+        "data_to_method_outputs.svg": {
+            "caption": "Data-to-method output workflow connecting inputs, generated code, and result artifacts.",
+            "claim": f"The data-to-method output workflow shows how the generated pipeline turns {selected_input} into metrics, summaries, and figures for Results writing.",
+        },
+        "metrics.csv": {
+            "caption": "Parsed scalar metrics from the verified method run.",
+            "claim": f"The metrics table records the observed method output used by the result validity gate, including {metric_text}.",
+        },
+        "analysis_summary.csv": {
+            "caption": "Analysis summary produced by the generated method pipeline.",
+            "claim": "The analysis summary records selected input data, detected label column, method families, and generation metadata for traceability.",
+        },
     }
 
 
-def _table_entry(project_path: Path, path: Path, index: int) -> dict[str, str]:
+def _figure_entry(project_path: Path, path: Path, index: int, context: dict[str, dict[str, str]]) -> dict[str, str]:
     relative = path.relative_to(project_path).as_posix()
+    details = context.get(path.name, {})
+    return {
+        "id": _artifact_id("fig", index, path),
+        "path": relative,
+        "caption_draft": details.get("caption") or f"Result figure {index}: {path.stem.replace('_', ' ')}.",
+        "result_claim": details.get("claim") or f"The artifact {relative} provides visual evidence for one result that should be interpreted directly from the generated output.",
+    }
+
+
+def _table_entry(project_path: Path, path: Path, index: int, context: dict[str, dict[str, str]]) -> dict[str, str]:
+    relative = path.relative_to(project_path).as_posix()
+    details = context.get(path.name, {})
     return {
         "id": _artifact_id("table", index, path),
         "path": relative,
-        "caption_draft": f"Result table {index}: {path.stem.replace('_', ' ')}.",
-        "result_claim": f"The artifact {relative} provides tabular evidence for one result that should be interpreted directly from the generated output.",
+        "caption_draft": details.get("caption") or f"Result table {index}: {path.stem.replace('_', ' ')}.",
+        "result_claim": details.get("claim") or f"The artifact {relative} provides tabular evidence for one result that should be interpreted directly from the generated output.",
     }
 
 
@@ -88,11 +136,14 @@ def inventory_results(project: str | Path) -> dict[str, Any]:
 
     figure_paths = sorted(path for path in figures_dir.iterdir() if path.is_file() and path.suffix.lower() in FIGURE_EXTENSIONS)
     table_paths = sorted(path for path in tables_dir.iterdir() if path.is_file() and path.suffix.lower() in TABLE_EXTENSIONS)
+    context = _artifact_context(state.path)
     manifest = {
-        "figures": [_figure_entry(state.path, path, index + 1) for index, path in enumerate(figure_paths)],
-        "tables": [_table_entry(state.path, path, index + 1) for index, path in enumerate(table_paths)],
+        "figures": [_figure_entry(state.path, path, index + 1, context) for index, path in enumerate(figure_paths)],
+        "tables": [_table_entry(state.path, path, index + 1, context) for index, path in enumerate(table_paths)],
     }
     _write_json(results_dir / "result_manifest.yaml", manifest)
+    update_stage_status(state.path, "results", "draft")
+    _set_results_stage_manifest(state.path)
     return {
         "status": "written",
         "project_path": str(state.path),

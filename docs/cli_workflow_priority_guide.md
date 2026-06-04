@@ -310,9 +310,16 @@ methods/method_requirements.json
 methods/analysis_code_manifest.json
 methods/run_manifest.yaml
 methods/methods.tex
+code/stage_manifest.json
 code/scripts/run_analysis.py
 code/src/generated_pipeline.py
 code/tests/test_generated_pipeline.py
+results/tables/metrics.csv
+results/tables/analysis_summary.csv
+results/figures/data_analysis_flow.svg
+results/figures/data_processing_flow.svg
+results/figures/method_analysis_flow.svg
+results/figures/data_to_method_outputs.svg
 ```
 
 `methods/method_plan.md` records the user's method input from UI/CLI, literature-derived method patterns, inferred method families, data requirements implied by the method, and the expected result validity metric. `methods/method_requirements.json` is the machine-readable contract used by later gates.
@@ -326,13 +333,13 @@ Implemented Priority 6 CLI commands:
 ```powershell
 python -m draftpaper_cli.cli collect-method-plan --project C:\DraftPaper_CLI\projects\my_project --method-note "Use a multimodal classifier" --primary-metric f1 --minimum-primary-metric 0.75
 python -m draftpaper_cli.cli generate-analysis-code --project C:\DraftPaper_CLI\projects\my_project
-python -m draftpaper_cli.cli verify-methods --project C:\DraftPaper_CLI\projects\my_project --command "python code/scripts/run_analysis.py" --output results/tables/metrics.csv --output results/tables/analysis_summary.csv
+python -m draftpaper_cli.cli verify-methods --project C:\DraftPaper_CLI\projects\my_project --command "python code/scripts/run_analysis.py" --output results/tables/metrics.csv --output results/tables/analysis_summary.csv --output results/figures/data_analysis_flow.svg --output results/figures/data_processing_flow.svg --output results/figures/method_analysis_flow.svg --output results/figures/data_to_method_outputs.svg
 python -m draftpaper_cli.cli write-methods --project C:\DraftPaper_CLI\projects\my_project
 ```
 
 `collect-method-plan` reads the research plan, data feasibility report, and ranked literature notes. It does not replace user expertise; it creates a structured method contract that combines user-provided method intent with literature method synthesis.
 
-`generate-analysis-code` reads `references/literature_items.json`, `methods/method_plan.md`, `methods/method_requirements.json`, and `data/data_inventory.json`. It writes deterministic project-local baseline code under `code/` and records the generated command, selected input data, literature method sources, method families, and declared outputs in `methods/analysis_code_manifest.json`. This is a reviewable scaffold for local analysis, not permission to skip code review or result validity checks.
+`generate-analysis-code` reads `references/literature_items.json`, `methods/method_plan.md`, `methods/method_requirements.json`, and `data/data_inventory.json`. It writes deterministic project-local baseline code under `code/`, records the generated command, selected input data, literature method sources, method families, and declared outputs in `methods/analysis_code_manifest.json`, and marks the `code` stage as draft so Methods and downstream stages become stale. The default generated run produces two tables plus four SVG figures: data analysis workflow, data processing workflow, method analysis workflow, and data-to-method output workflow. This is a reviewable scaffold for local analysis, not permission to skip code review or result validity checks.
 
 `verify-methods` runs the provided command from the project directory and writes `methods/run_manifest.yaml` as JSON-compatible YAML. The manifest records command, return code, input data, declared output files, parsed CSV metrics, generated tables/figures, timestamps, stdout/stderr snippets, and missing outputs.
 
@@ -350,7 +357,7 @@ results/result_validity_report.md
 results/result_manifest.yaml
 ```
 
-Rules: Results must not contain citations, every result subsection must bind to a real figure or table, figure insertion belongs at the end of the corresponding subsection, and the text must not claim more than the result files support.
+Rules: Results must not contain citations, every result subsection must bind to a real figure or table, figure insertion belongs at the end of the corresponding subsection, and the text must not claim more than the result files support. `inventory-results` reads verified figures/tables plus `methods/analysis_code_manifest.json` and `methods/run_manifest.yaml` so the result manifest describes what each method-generated artifact supports before `write-results` turns it into paragraphs.
 
 Implemented Priority 7 CLI commands:
 
@@ -580,6 +587,7 @@ research_plan
 introduction
 data
 method_plan
+code
 methods
 result_validity
 results
@@ -601,7 +609,7 @@ python -m draftpaper_cli.cli assess-data-quality --project C:\DraftPaper_CLI\pro
 python -m draftpaper_cli.cli assess-data-feasibility --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli collect-method-plan --project C:\DraftPaper_CLI\projects\my_project --method-note "..." --primary-metric f1 --minimum-primary-metric 0.75
 python -m draftpaper_cli.cli generate-analysis-code --project C:\DraftPaper_CLI\projects\my_project
-python -m draftpaper_cli.cli verify-methods --project C:\DraftPaper_CLI\projects\my_project --command "python code/scripts/run_analysis.py" --output results/tables/metrics.csv --output results/tables/analysis_summary.csv
+python -m draftpaper_cli.cli verify-methods --project C:\DraftPaper_CLI\projects\my_project --command "python code/scripts/run_analysis.py" --output results/tables/metrics.csv --output results/tables/analysis_summary.csv --output results/figures/data_analysis_flow.svg --output results/figures/data_processing_flow.svg --output results/figures/method_analysis_flow.svg --output results/figures/data_to_method_outputs.svg
 python -m draftpaper_cli.cli assess-result-validity --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli inventory-results --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli write-results --project C:\DraftPaper_CLI\projects\my_project
