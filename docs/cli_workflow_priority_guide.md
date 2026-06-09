@@ -124,6 +124,7 @@ research_paper_agent/data/projects/
       sections/
       template/
     integrity/
+    review/
     quality_checks/
 ```
 
@@ -606,6 +607,64 @@ Codex skill wrapper
 Future Web UI / desktop app / API service
 ```
 
+## Priority E: Review, Revision Routing, and Re-review Loop
+
+After the hard gates exist, the workflow needs a review-revise-re-review loop. This loop has two layers that share one unified revision issue schema. The first layer converts failed gates into actionable backtracking instructions. The second layer adds a reviewer-style manuscript pass and feeds those issues into the same revision plan.
+
+Implemented Priority E CLI commands:
+
+```powershell
+python -m draftpaper_cli.cli diagnose-gate-failures --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli review-draft --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli generate-revision-plan --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli apply-revision --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli re-review --project C:\DraftPaper_CLI\projects\my_project
+```
+
+Outputs:
+
+```text
+review/gate_failure_diagnosis.json
+review/gate_failure_diagnosis.md
+review/review_report.md
+review/reviewer_issues.json
+review/revision_plan.json
+review/revision_plan.md
+review/commitment_ledger.csv
+review/apply_revision_report.json
+review/apply_revision_report.md
+review/re_review_report.json
+review/re_review_report.md
+```
+
+Every issue uses the same schema:
+
+```json
+{
+  "issue_id": "V-12345678",
+  "source": "result_validity",
+  "code": "revise_required",
+  "severity": "blocking",
+  "target_stage": "methods",
+  "title": "Results do not support the planned claim strength",
+  "reason": "Observed f1 is below the planned threshold.",
+  "files_to_add_or_edit": ["methods/run_manifest.yaml", "methods/method_requirements.json"],
+  "recommended_commands": ["generate-analysis-code", "verify-methods", "assess-result-validity"],
+  "required_user_input": "Decide whether to revise the method/data route or lower the manuscript claim strength.",
+  "status": "pending"
+}
+```
+
+`diagnose-gate-failures` reads the data feasibility report, method run manifest, result validity report, integrity report, and quality report. It does not merely say a gate failed; it maps each failure to a target stage, files to inspect, required user decision, and the CLI commands that should be rerun.
+
+`review-draft` is a deterministic reviewer-style pass. It checks whether the assembled manuscript exists, whether Methods are reproducible from a successful run manifest, whether result claim strength matches the result validity decision, and whether Discussion exists after Results. This is intentionally conservative and does not replace human review.
+
+`generate-revision-plan` merges gate diagnosis and reviewer issues into `review/revision_plan.json` and `review/commitment_ledger.csv`. The commitment ledger records issue id, source, target stage, decision, status, and the user's revision commitment so later re-review can audit what was supposed to change.
+
+`apply-revision` currently applies only the safe part of revision: it marks affected target stages and their downstream dependents stale. It does not rewrite scientific content automatically. This is deliberate: adding data, changing methods, or lowering conclusions requires user confirmation and a normal rerun of the staged CLI commands.
+
+`re-review` reruns gate diagnosis, reviewer pass, and revision planning after revisions. It writes a compact report showing remaining gate issues, reviewer issues, and total revision issues.
+
 ## Priority 13: Data Feasibility Gate
 
 Data feasibility is a core scientific hard gate before method planning and Methods. The system must not continue into formal Methods writing when the available data cannot support the stated research goal. Literature-derived data expectations are treated as evidence for assessment, not as a universal hard standard; the decisive question is whether the current study's data can support the current research plan and method plan.
@@ -705,6 +764,11 @@ python -m draftpaper_cli.cli write-discussion --project C:\DraftPaper_CLI\projec
 python -m draftpaper_cli.cli assemble-latex --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli run-integrity-gate --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli quality-check --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli diagnose-gate-failures --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli review-draft --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli generate-revision-plan --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli apply-revision --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli re-review --project C:\DraftPaper_CLI\projects\my_project
 ```
 
 ## Implementation Rule

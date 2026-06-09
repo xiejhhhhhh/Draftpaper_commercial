@@ -43,6 +43,7 @@ class ProjectScaffoldTests(unittest.TestCase):
                 "latex/sections",
                 "latex/template",
                 "integrity",
+                "review",
                 "quality_checks",
             ]
             for relative in expected_dirs:

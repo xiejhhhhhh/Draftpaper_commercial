@@ -29,6 +29,14 @@ from .project_state import (
 )
 from .quality_gate import QualityGateError, run_quality_check
 from .research_plan import MissingReferencesError, NoveltyOverlapError, generate_research_plan
+from .review_revision import (
+    ReviewRevisionError,
+    apply_revision,
+    diagnose_gate_failures,
+    generate_revision_plan,
+    re_review,
+    review_draft,
+)
 from .result_validity import ResultValidityError, assess_result_validity
 from .results import ResultsGateError, inventory_results, write_results
 from .stale_sync import ArtifactDriftError, detect_artifact_drift, sync_artifact_stale
@@ -163,6 +171,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     integrity = subparsers.add_parser("run-integrity-gate", help="Run citation evidence and result artifact integrity checks.")
     integrity.add_argument("--project", required=True, help="Path to a project directory or project.json.")
+
+    diagnose = subparsers.add_parser("diagnose-gate-failures", help="Convert failed gates into actionable revision issues.")
+    diagnose.add_argument("--project", required=True, help="Path to a project directory or project.json.")
+
+    review = subparsers.add_parser("review-draft", help="Run a reviewer-style manuscript pass and write review artifacts.")
+    review.add_argument("--project", required=True, help="Path to a project directory or project.json.")
+
+    revision_plan = subparsers.add_parser("generate-revision-plan", help="Merge gate diagnosis and reviewer issues into a revision plan.")
+    revision_plan.add_argument("--project", required=True, help="Path to a project directory or project.json.")
+
+    apply = subparsers.add_parser("apply-revision", help="Safely apply a revision plan by marking affected stages stale.")
+    apply.add_argument("--project", required=True, help="Path to a project directory or project.json.")
+    apply.add_argument("--issue-id", action="append", default=[], help="Only apply selected revision issue ids. Can be repeated.")
+    apply.add_argument("--dry-run", action="store_true", help="Report affected stages without marking them stale.")
+
+    rereview = subparsers.add_parser("re-review", help="Rerun gate diagnosis, reviewer pass, and revision planning.")
+    rereview.add_argument("--project", required=True, help="Path to a project directory or project.json.")
     return parser
 
 
@@ -551,6 +576,51 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result.get("status") == "passed" else 1
+
+    if args.command == "diagnose-gate-failures":
+        try:
+            result = diagnose_gate_failures(args.project)
+        except ReviewRevisionError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "review-draft":
+        try:
+            result = review_draft(args.project)
+        except ReviewRevisionError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "generate-revision-plan":
+        try:
+            result = generate_revision_plan(args.project)
+        except ReviewRevisionError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "apply-revision":
+        try:
+            result = apply_revision(args.project, issue_ids=args.issue_id, dry_run=args.dry_run)
+        except ReviewRevisionError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "re-review":
+        try:
+            result = re_review(args.project)
+        except ReviewRevisionError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
 
     parser.print_help()
     return 1

@@ -34,6 +34,7 @@ The reference workflow uses free literature providers first, including Semantic 
 - Results no-citation enforcement.
 - LaTeX assembly with optional local PDF compilation.
 - Independent integrity gate for BibTeX existence, citation evidence, and result artifact binding.
+- Review-revise-re-review loop with gate-failure routing and commitment ledger.
 - Quality gate for citations, result artifacts, stale stages, and journal template checks.
 - Codex skill wrapper that remains only a calling layer.
 
@@ -74,6 +75,8 @@ python -m draftpaper_cli.cli run-pipeline --project C:\DraftPaper_CLI\projects\y
 python -m draftpaper_cli.cli detect-artifact-drift --project C:\DraftPaper_CLI\projects\your_project
 python -m draftpaper_cli.cli sync-artifact-stale --project C:\DraftPaper_CLI\projects\your_project
 python -m draftpaper_cli.cli run-integrity-gate --project C:\DraftPaper_CLI\projects\your_project
+python -m draftpaper_cli.cli diagnose-gate-failures --project C:\DraftPaper_CLI\projects\your_project
+python -m draftpaper_cli.cli generate-revision-plan --project C:\DraftPaper_CLI\projects\your_project
 ```
 
 ### One-Command Local Setup
@@ -128,7 +131,7 @@ python -m unittest discover -s tests
 
 ## Implementation Status
 
-The CLI already includes an orchestrator layer (`status`, `checkpoint`, `resume`, `run-pipeline`) plus hash-based stale synchronization (`detect-artifact-drift`, `sync-artifact-stale`) and staged commands for project state, literature search, journal profile resolution, research plan generation, Introduction, data inventory and feasibility checks, method-plan collection, literature-informed baseline analysis-code generation, method execution verification, Methods writing, result validity checks, result inventory, Results writing, Discussion, LaTeX assembly, PDF compilation, independent integrity checks, and final quality checks.
+The CLI already includes an orchestrator layer (`status`, `checkpoint`, `resume`, `run-pipeline`) plus hash-based stale synchronization (`detect-artifact-drift`, `sync-artifact-stale`) and staged commands for project state, literature search, journal profile resolution, research plan generation, Introduction, data inventory and feasibility checks, method-plan collection, literature-informed baseline analysis-code generation, method execution verification, Methods writing, result validity checks, result inventory, Results writing, Discussion, LaTeX assembly, PDF compilation, independent integrity checks, review/revision routing, and final quality checks.
 
 Every project now carries a DraftPaper Passport at `project_passport.yaml` plus append-only `artifact_ledger.jsonl`, `checkpoint_ledger.jsonl`, and `integrity_ledger.jsonl`. These files record project artifacts, hashes, explicit user checkpoints, and integrity events so the project can be moved across machines and later audited without relying on Codex conversation memory.
 
@@ -137,6 +140,8 @@ When a tracked artifact hash changes, `status` reports `pipeline_state=drift_det
 `generate-analysis-code` reads retrieved literature, `methods/method_requirements.json`, `methods/method_plan.md`, and `data/data_inventory.json`, then writes reviewable project-local Python code under `code/` plus `methods/analysis_code_manifest.json`. The generated baseline now produces two tables and four required SVG figures by default: data analysis workflow, data processing workflow, method analysis workflow, and data-to-method output workflow. It is intentionally a reproducible scaffold rather than a final scientific model; `verify-methods` must still run the generated command, record `methods/run_manifest.yaml`, and block Methods writing until every declared output exists. `inventory-results` then converts the verified figures and tables into `results/result_manifest.yaml`, and `write-results` writes citation-free result paragraphs from that manifest.
 
 `run-integrity-gate` writes `integrity/integrity_report.json` and `integrity/integrity_report.md`, then appends an `integrity_gate` event to `integrity_ledger.jsonl`. It checks that manuscript citations exist in BibTeX, that Introduction/Data/Methods/Discussion citations are traceable to `references/citation_evidence.csv`, that Results contains no citation commands, and that every result claim in `results/result_manifest.yaml` is bound to an existing local figure or table. When the project reaches `quality_checks`, `status` and `run-pipeline` recommend `run-integrity-gate` before final `quality-check` until the integrity report has passed.
+
+`diagnose-gate-failures`, `review-draft`, `generate-revision-plan`, `apply-revision`, and `re-review` implement the review-revise-re-review loop. Gate failures are converted into unified revision issues with target stages, files to inspect, required user decisions, and recommended CLI reruns. The reviewer layer adds a conservative manuscript-level pass, while `apply-revision` only marks affected stages stale; it does not rewrite scientific content without user confirmation.
 
 ## Paper Fetch Integration
 

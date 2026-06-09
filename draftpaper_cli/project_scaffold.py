@@ -41,6 +41,7 @@ PROJECT_DIRECTORIES = [
     "latex/sections",
     "latex/template",
     "integrity",
+    "review",
     "quality_checks",
 ]
 

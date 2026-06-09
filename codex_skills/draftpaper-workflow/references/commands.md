@@ -65,8 +65,15 @@ python -m draftpaper_cli.cli assemble-latex --project C:\DraftPaper_CLI\projects
 python -m draftpaper_cli.cli compile-latex-pdf --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli run-integrity-gate --project C:\DraftPaper_CLI\projects\my_project
 python -m draftpaper_cli.cli quality-check --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli diagnose-gate-failures --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli review-draft --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli generate-revision-plan --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli apply-revision --project C:\DraftPaper_CLI\projects\my_project
+python -m draftpaper_cli.cli re-review --project C:\DraftPaper_CLI\projects\my_project
 ```
 
 `run-integrity-gate` returns exit code `0` for passed and `1` for failed. It writes `integrity/integrity_report.json`, `integrity/integrity_report.md`, and appends an `integrity_gate` event to `integrity_ledger.jsonl`. Run it before `quality-check` to catch missing BibTeX keys, missing citation evidence, Results citations, missing result artifacts, and unbound result claims.
 
 `quality-check` returns exit code `0` for passed and `1` for failed. It still writes `quality_checks/quality_report.json` on failure.
+
+`diagnose-gate-failures` writes `review/gate_failure_diagnosis.json` and `.md`. `review-draft` writes `review/review_report.md` and `review/reviewer_issues.json`. `generate-revision-plan` writes `review/revision_plan.json`, `review/revision_plan.md`, and `review/commitment_ledger.csv`. `apply-revision` marks affected stages stale but does not rewrite scientific content. `re-review` reruns diagnosis, review, and planning and writes `review/re_review_report.md`.

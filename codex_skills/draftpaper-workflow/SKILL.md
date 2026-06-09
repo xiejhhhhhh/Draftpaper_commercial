@@ -52,32 +52,27 @@ Run stages in this order unless the user asks for a focused rerun:
 17. `assemble-latex`
 18. `run-integrity-gate`
 19. `quality-check`
+20. `diagnose-gate-failures`
+21. `review-draft`
+22. `generate-revision-plan`
+23. `apply-revision` when the user accepts a revision route
+24. `re-review`
 
 Use `assemble-latex --compile-pdf` when the user wants a local review PDF. Use `compile-latex-pdf` after manual edits under `latex/`.
 
 ## Rerun Rules
 
-If references change, rerun `generate-plan`, `write-introduction`, `write-discussion`, `assemble-latex`, `run-integrity-gate`, and `quality-check`.
-
-If journal profile or target template changes, rerun `generate-plan`, all writing stages, `assemble-latex`, `run-integrity-gate`, and `quality-check`.
-
-If research plan changes, rerun `write-introduction`, `inventory-data`, `assess-data-quality`, `assess-data-feasibility`, `collect-method-plan`, `generate-analysis-code`, affected method work, `write-methods`, `assess-result-validity`, `write-results`, `write-discussion`, `assemble-latex`, `run-integrity-gate`, and `quality-check`.
-
-If data changes, rerun `inventory-data`, `assess-data-quality`, `assess-data-feasibility`, `collect-method-plan`, `generate-analysis-code`, `verify-methods`, `write-methods`, `assess-result-validity`, `inventory-results`, `write-results`, `write-discussion`, `assemble-latex`, `run-integrity-gate`, and `quality-check`.
-
-If generated code changes, rerun `verify-methods`, `write-methods`, `assess-result-validity`, `inventory-results`, `write-results`, `write-discussion`, `assemble-latex`, `run-integrity-gate`, and `quality-check`.
-
-If method plan or methods code changes, rerun `collect-method-plan` when needed, `generate-analysis-code` when generated code is used, `verify-methods`, `write-methods`, `assess-result-validity`, `inventory-results`, `write-results`, `write-discussion`, `assemble-latex`, `run-integrity-gate`, and `quality-check`.
-
-If results change, rerun `assess-result-validity`, `inventory-results`, `write-results`, `write-discussion`, `assemble-latex`, `run-integrity-gate`, and `quality-check`.
-
-If only LaTeX template files change, rerun `assemble-latex`, `run-integrity-gate`, and `quality-check`.
+If upstream artifacts change, rerun from the earliest affected stage through downstream writing, `assemble-latex`, `run-integrity-gate`, and `quality-check`. If references change, rerun plan, Introduction, Discussion, assembly, integrity, and quality. Journal profile affects all writing and assembly; data affects method plan, code, methods, results, discussion, and assembly; code or method changes affect method verification onward. If results change, rerun result validity onward. If only LaTeX template files change, rerun assembly, integrity, and quality.
 
 ## Gates
 
-Never generate the research plan or writing stages before `resolve-journal-template` has produced a current journal profile. If `generate-plan` returns `blocked_high_similarity`, stop and report the similar paper warning; rerun with `--allow-high-similarity` only after the user explicitly chooses to continue. Never verify or write Methods before `assess-data-feasibility` returns `pass` or `conditional_pass` and `collect-method-plan` has produced method requirements. When generated code is needed, run `generate-analysis-code` before `verify-methods`, then use the returned `verify_command` and declared outputs. The default generated outputs include `metrics.csv`, `analysis_summary.csv`, and four SVG figures for data analysis, data processing, method analysis, and data-to-method outputs. If data feasibility returns `revise_required` or `blocked`, stop and report whether the user should add data, lower claim strength, revise the research question, or abandon the current paper plan. Never write Results before `assess-result-validity` returns `pass` or `conditional_pass`. Always run `inventory-results` before `write-results` so the result paragraphs are derived from verified figures and tables. If result validity fails, report whether the likely backtracking target is data, method, or research plan. Results must contain no citation commands. Discussion may cite literature, but citation keys must come from BibTeX and citation evidence. Data and Methods citation evidence is context-specific: if `citation_evidence.csv` contains `section=data` or `section=methods`, the matching manuscript section should cite at least one corresponding key or integrity/quality checks will report it. Always run `run-integrity-gate` before final `quality-check`; if it fails, route the fix back to references, section citation use, or result manifest/artifacts before telling the user a draft package is ready.
+Never generate the research plan or writing stages before `resolve-journal-template` has produced a current journal profile. Stop on `blocked_high_similarity` unless the user explicitly continues with `--allow-high-similarity`. Never verify/write Methods before data feasibility is `pass` or `conditional_pass` and method requirements exist. Run `generate-analysis-code` before `verify-methods` when generated code is used. Never write Results before result validity passes or conditionally passes; always run `inventory-results` before `write-results`. Results must contain no citations. Discussion citations must come from BibTeX and citation evidence. Always run `run-integrity-gate` before final `quality-check`; route failures back to references, section citations, result manifest, or artifacts.
 
 Every project has `project_passport.yaml`, `artifact_ledger.jsonl`, `checkpoint_ledger.jsonl`, and `integrity_ledger.jsonl`. Treat these files as append-only audit state owned by the core CLI. Do not edit them manually; use `status`, `checkpoint`, `resume`, or stage commands.
+
+## Review and Revision Loop
+
+When any gate fails, run `diagnose-gate-failures` before giving broad advice. After an assembled draft exists, run `review-draft`, then `generate-revision-plan`. Do not let `apply-revision` rewrite scientific content; it only marks affected stages stale. If the plan requires adding data, changing methods, or lowering claims, ask the user to confirm the scientific choice. After reruns, use `re-review`.
 
 ## Skill Reuse
 
