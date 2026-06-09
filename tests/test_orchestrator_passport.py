@@ -158,6 +158,77 @@ class OrchestratorPassportTests(unittest.TestCase):
             self.assertEqual(status_after_integrity["next_action"]["stage"], "quality_checks")
             self.assertEqual(status_after_integrity["next_action"]["command"], "quality-check")
 
+    def test_status_recommends_gate_failure_diagnosis_after_integrity_failure(self) -> None:
+        from draftpaper_cli.orchestrator import status_project
+        from draftpaper_cli.passport import refresh_project_passport
+        from draftpaper_cli.project_scaffold import _write_json
+        from draftpaper_cli.project_state import update_stage_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = create_project(root=tmp, idea="Diagnose integrity failure", field="workflow engineering")
+            for stage in [
+                "references",
+                "journal_profile",
+                "research_plan",
+                "introduction",
+                "data",
+                "method_plan",
+                "code",
+                "methods",
+                "result_validity",
+                "results",
+                "discussion",
+                "latex",
+            ]:
+                update_stage_status(project.path, stage, "completed")
+            _write_json(project.path / "integrity" / "integrity_report.json", {
+                "status": "failed",
+                "issues": [{"severity": "error", "code": "missing_citation_evidence", "message": "Missing evidence."}],
+            })
+            refresh_project_passport(project.path, event="test_integrity_failed")
+
+            status = status_project(project.path)
+
+            self.assertEqual(status["next_action"]["stage"], "review")
+            self.assertEqual(status["next_action"]["command"], "diagnose-gate-failures")
+            self.assertIn("diagnose-gate-failures", status["next_action"]["cli"])
+
+    def test_run_pipeline_recommends_gate_failure_diagnosis_after_quality_failure(self) -> None:
+        from draftpaper_cli.orchestrator import run_pipeline
+        from draftpaper_cli.passport import refresh_project_passport
+        from draftpaper_cli.project_scaffold import _write_json
+        from draftpaper_cli.project_state import update_stage_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = create_project(root=tmp, idea="Diagnose quality failure", field="workflow engineering")
+            for stage in [
+                "references",
+                "journal_profile",
+                "research_plan",
+                "introduction",
+                "data",
+                "method_plan",
+                "code",
+                "methods",
+                "result_validity",
+                "results",
+                "discussion",
+                "latex",
+            ]:
+                update_stage_status(project.path, stage, "completed")
+            update_stage_status(project.path, "quality_checks", "failed")
+            _write_json(project.path / "integrity" / "integrity_report.json", {"status": "passed"})
+            _write_json(project.path / "quality_checks" / "quality_report.json", {
+                "status": "failed",
+                "issues": [{"severity": "error", "code": "required_artifact_missing", "message": "Missing artifact."}],
+            })
+            refresh_project_passport(project.path, event="test_quality_failed")
+
+            plan = run_pipeline(project.path)
+
+            self.assertEqual(plan["next_action"]["stage"], "review")
+            self.assertEqual(plan["next_action"]["command"], "diagnose-gate-failures")
+
 
 if __name__ == "__main__":
     unittest.main()

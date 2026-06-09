@@ -67,6 +67,37 @@ def _integrity_is_current(project_path: Path) -> bool:
     return isinstance(report, dict) and report.get("status") == "passed"
 
 
+def _read_report(project_path: Path, relative: str) -> dict[str, Any]:
+    path = project_path / relative
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _gate_failure_action(project_path: Path) -> dict[str, Any] | None:
+    integrity = _read_report(project_path, "integrity/integrity_report.json")
+    if integrity and integrity.get("status") not in {"passed", "pass"}:
+        return {
+            "stage": "review",
+            "command": "diagnose-gate-failures",
+            "cli": _cli_for(project_path, "diagnose-gate-failures"),
+            "reason": "The integrity gate failed; run gate failure diagnosis before rerunning downstream manuscript stages.",
+        }
+    quality = _read_report(project_path, "quality_checks/quality_report.json")
+    if quality and quality.get("status") not in {"passed", "pass"}:
+        return {
+            "stage": "review",
+            "command": "diagnose-gate-failures",
+            "cli": _cli_for(project_path, "diagnose-gate-failures"),
+            "reason": "The final quality gate failed; run gate failure diagnosis to map issues to revision stages.",
+        }
+    return None
+
+
 def _next_stage(metadata: dict[str, Any]) -> str | None:
     stages = metadata.get("stages") or {}
     for stage in STAGE_ORDER:
@@ -80,6 +111,9 @@ def _next_stage(metadata: dict[str, Any]) -> str | None:
 
 def _next_action(project_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
     stage = _next_stage(metadata)
+    failure_action = _gate_failure_action(project_path)
+    if failure_action and (stage is None or stage == "quality_checks"):
+        return failure_action
     if stage is None:
         return {
             "stage": None,

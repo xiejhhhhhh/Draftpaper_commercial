@@ -72,7 +72,7 @@ Every project has `project_passport.yaml`, `artifact_ledger.jsonl`, `checkpoint_
 
 ## Review and Revision Loop
 
-When any gate fails, run `diagnose-gate-failures` before giving broad advice. After an assembled draft exists, run `review-draft`, then `generate-revision-plan`. Do not let `apply-revision` rewrite scientific content; it only marks affected stages stale. If the plan requires adding data, changing methods, or lowering claims, ask the user to confirm the scientific choice. After reruns, use `re-review`.
+When any gate fails, run `diagnose-gate-failures` before giving broad advice. `status` and `run-pipeline` recommend it automatically when integrity or final quality reports failed. After an assembled draft exists, run `review-draft`, then `generate-revision-plan`. Do not let `apply-revision` rewrite scientific content; it only marks affected stages stale. If the plan requires adding data, changing methods, or lowering claims, ask the user to confirm the scientific choice. After reruns, use `re-review`.
 
 ## Skill Reuse
 

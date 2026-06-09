@@ -86,7 +86,7 @@ Every result manifest entry has a result_claim
 
 The command returns exit code `0` only when the integrity report passes. It still writes the JSON and Markdown reports on failure. Each run appends an `integrity_gate` event to `integrity_ledger.jsonl`, which lets Codex, Web UI, or later batch workflows audit when a manuscript draft last passed or failed traceability checks.
 
-`status` and `run-pipeline` are now connected to this gate. When the next pending stage is `quality_checks`, the orchestrator recommends `run-integrity-gate` until `integrity/integrity_report.json` exists with `status=passed`. After that, the normal next action becomes `quality-check`.
+`status` and `run-pipeline` are now connected to this gate. When the next pending stage is `quality_checks`, the orchestrator recommends `run-integrity-gate` until `integrity/integrity_report.json` exists with `status=passed`. If the integrity report exists and failed, the orchestrator recommends `diagnose-gate-failures` instead of blindly rerunning the same failed gate. After integrity passes, the normal next action becomes `quality-check`.
 
 ## Priority 1: Single-Paper Project Directory Model
 
@@ -656,6 +656,8 @@ Every issue uses the same schema:
 ```
 
 `diagnose-gate-failures` reads the data feasibility report, method run manifest, result validity report, integrity report, and quality report. It does not merely say a gate failed; it maps each failure to a target stage, files to inspect, required user decision, and the CLI commands that should be rerun.
+
+`status` and `run-pipeline` also route into this layer. If `integrity/integrity_report.json` or `quality_checks/quality_report.json` exists with a failed status while the project is at the final quality stage, the next action becomes `diagnose-gate-failures`. This prevents the user from getting trapped in repeated gate reruns without a concrete backtracking plan.
 
 `review-draft` is a deterministic reviewer-style pass. It checks whether the assembled manuscript exists, whether Methods are reproducible from a successful run manifest, whether result claim strength matches the result validity decision, and whether Discussion exists after Results. This is intentionally conservative and does not replace human review.
 
